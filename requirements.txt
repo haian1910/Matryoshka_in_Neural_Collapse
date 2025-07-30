@@ -1,0 +1,11 @@
+scikit-learn
+scipy
+matplotlib
+deepspeed==0.16.5
+peft==0.15.1
+editdistance==0.8.1
+pandas
+llm2vec
+sentence_transformers==4.1.0
+transformers==4.51.3
+flash-attn
