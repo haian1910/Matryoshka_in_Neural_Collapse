@@ -19,8 +19,6 @@ from utils import log_rank
 from huggingface_hub import login
 import torch.distributed as dist
 import os
-#token = os.getenv("HF_TOKEN")
-#login(token=token)
 
 class Distiller(nn.Module):
     def __init__(self, args, device):
