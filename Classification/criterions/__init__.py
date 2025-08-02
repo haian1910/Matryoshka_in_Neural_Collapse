@@ -4,7 +4,7 @@ from .dual_space_kd_with_cross_model_attention import DualSpaceKDWithCMA
 from .universal_logit_distillation import UniversalLogitDistillation
 from .min_edit_dis_kld import MinEditDisForwardKLD
 from .multi_level_ot import MULTI_LEVEL_OT
-
+from .matry_CE.py import Matry_CrossEntropyLoss
 criterion_list = {
     "cross_entropy": CrossEntropyLoss,
     "various_divergence": VariousDivergence,
@@ -13,6 +13,7 @@ criterion_list = {
     "min_edit_dis_kld": MinEditDisForwardKLD,
     "min_edit_dis_kld": MinEditDisForwardKLD,
     "multi_level_ot": MULTI_LEVEL_OT
+    "matry_ce": Matry_CrossEntropyLoss
 }
 
 def build_criterion(args):
