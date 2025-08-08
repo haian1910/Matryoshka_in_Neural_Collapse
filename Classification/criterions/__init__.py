@@ -12,7 +12,7 @@ criterion_list = {
     "universal_logit_distillation": UniversalLogitDistillation,
     "min_edit_dis_kld": MinEditDisForwardKLD,
     "min_edit_dis_kld": MinEditDisForwardKLD,
-    "multi_level_ot": MULTI_LEVEL_OT
+    "multi_level_ot": MULTI_LEVEL_OT,
     "matry_CE": Matry_CrossEntropyLoss
 }
 
