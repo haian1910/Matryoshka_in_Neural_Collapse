@@ -13,7 +13,7 @@ criterion_list = {
     "min_edit_dis_kld": MinEditDisForwardKLD,
     "min_edit_dis_kld": MinEditDisForwardKLD,
     "multi_level_ot": MULTI_LEVEL_OT
-    "matry_ce": Matry_CrossEntropyLoss
+    "matry_CE": Matry_CrossEntropyLoss
 }
 
 def build_criterion(args):
