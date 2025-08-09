@@ -72,7 +72,6 @@ def prepare_dataset(args, distiller):
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
     log_rank("Start Fine-tuning")
     start_time = time.time()
-
     if args.model_parallel:
         raise NotImplementedError
     else:
@@ -80,7 +79,6 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         dp_rank = dist.get_rank()
         dp_group = None
         criterion = build_criterion(args)
-
     sampler = DistributedSampler(
         dataset["train"], 
         shuffle=True, 
@@ -116,21 +114,17 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         log_rank("Start iterations of epoch {}".format(epoch + 1))
         model.train()
         print("Training mode?", model.student_model.training)  # True
-
         epoch_start_time = time.time()
         step = 0
         total_samples = 0
         total_time = 0.0
-
         data_iter = train_loader
         if dist.get_rank() == 0:
             data_iter = tqdm(train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
-
         for batch in data_iter:
             st_time = time.time()
             input_batch, output_batch = batch
             dataset["train"].move_to_device([input_batch, output_batch], device)
-
             loss, logging_output = model(
                 criterion,
                 {"input_batch": input_batch, "output_batch": output_batch},
@@ -141,92 +135,32 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             if torch.isnan(loss) or torch.isinf(loss):
                 print("⚠️ Loss is NaN or Inf. Skipping this step.")
                 continue
-
             
             model.backward(loss)
             model.step()
-            torch.cuda.synchronize()  # correctlyc compute time
-
+            torch.cuda.synchronize()  # correctly compute time
             elapsed_time = time.time() - st_time
             num_samples = input_batch["input_ids"].size(0)
             total_samples += num_samples
             total_time += elapsed_time
             step += 1
-
             logging_output["global_step"] += 1
             logging_output["micro_step_time"].append(elapsed_time)
             logging_output["step_time"].append(elapsed_time)
-
             if dist.get_rank() == 0:
                 data_iter.set_postfix(loss=loss.item())
-
         dist.barrier()
-
         if args.save_dir and (epoch + 1) % args.save_interval == 0 and dist.get_rank() == 0: #save_interval = 1 then save each epoch
             #eval_interval = 1 then evaluate each epoch
             log_rank("Evaluating before saving model...")
-            eval_results = evaluate_mrl(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
+            eval_results = evaluate_mrl_with_nc(args, tokenizer, model.module.student_model, dataset["dev"], "dev", device)
             
-            # Use the best granularity for model selection (largest by default)
+            # Use the best granularity for model selection (overall metrics)
             eval_loss = eval_results['overall']['loss']
             eval_accu = eval_results['overall']['accuracy']
             
-            if "test" in dataset: #evaluate for test, no affect
-                _ = evaluate_mrl(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
-            
-            # ckpt_name = "epoch{}_step{}_loss{:.4f}".format(epoch + 1, logging_output["global_step"], eval_loss)
-            # we dont need to save student model checkpoint
-            # save_dir_path = os.path.join(args.save_dir, ckpt_name)
-            
-            # os.makedirs(save_dir_path, exist_ok=True)
-            # if not args.only_save_projector:
-            #     log_rank("Saving tokenizer...")
-            #     tokenizer.save_pretrained(save_dir_path)
-            #     log_rank("Saving model...")
-            #     model.module.student_model.save_pretrained(save_dir_path, safe_serialization=False)
-                
-            #     # Save classifier heads for MRL
-            #     classifier_path = os.path.join(save_dir_path, "classifier_head.bin")
-            #     if hasattr(model.module.student_model, 'mrl_classifier'):  # MRL model
-            #         log_rank("Saving MRL classifier heads...")
-            #         torch.save(model.module.student_model.mrl_classifier.state_dict(), classifier_path)
-            #     elif hasattr(model.module.student_model, 'score'):  # Mistral model
-            #         log_rank("Saving Mistral classifier head (score)...")
-            #         torch.save(model.module.student_model.score.state_dict(), classifier_path)
-            #     elif hasattr(model.module.student_model, 'classifier'):  # BERT model
-            #         log_rank("Saving BERT classifier head (classifier)...")
-            #         torch.save(model.module.student_model.classifier.state_dict(), classifier_path)
-            #     else:
-            #         log_rank("Warning: Could not identify classifier head structure, no classifier saved.")
-                
-            #     log_rank("Saving config")
-            #     model.module.student_model.config.save_pretrained(save_dir_path)
-                
-            #     # Save MRL specific config
-            #     mrl_config = {
-            #         'nesting_list': getattr(args, 'mrl_nesting_list', [64, 128, 256, 512, 768]),
-            #         'mrl_efficient': getattr(args, 'mrl_efficient', False),
-            #         'mrl_relative_importance': getattr(args, 'mrl_relative_importance', None)
-            #     }
-            #     with open(os.path.join(save_dir_path, "mrl_config.json"), "w") as f:
-            #         json.dump(mrl_config, f, indent=2)
-                    
-            # if hasattr(model.module, "projectors"):
-            #     log_rank("Saving projector...")
-            #     torch.save(
-            #         model.module.projectors.state_dict(), 
-            #         os.path.join(save_dir_path, "projector.pt")
-            #     )
-            
-            # model_list.append({"path": save_dir_path, "score": eval_accu}) #store model list in term of eval_accuracy
-            # model_list = sorted(model_list, key=lambda x: x["score"], reverse=True)  # Higher accuracy is better
-            
-            # if len(model_list) > args.keep_best_n_checkpoints:
-            #     removed_model = model_list.pop()  # Remove the worst model
-            #     shutil.rmtree(removed_model["path"])
-
-            # log_rank(f"Model has been saved to {save_dir_path}")
-        
+            if "test" in dataset: #evaluate for test, no effect
+                test_results = evaluate_mrl_with_nc(args, tokenizer, model.module.student_model, dataset["test"], "test", device)
             
     total_seconds = time.time() - start_time
     log_rank("Done training in {:0>2}:{:0>2}:{:0>2}".format(
@@ -235,10 +169,24 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         int(total_seconds % 60)
     ))
 
-@torch.no_grad
-def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
+# Import neural collapse measurement functions
+try:
+    from neural_collapse.measure import (
+        variability_cdnv, 
+        mean_norms, 
+        interference_grid, 
+        simplex_etf_error
+    )
+    from neural_collapse.accumulate import MeanAccumulator, VarNormAccumulator
+    NC_AVAILABLE = True
+except ImportError:
+    print("Warning: neural_collapse library not available. Neural collapse metrics will be skipped.")
+    NC_AVAILABLE = False
+
+def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device):
     """
-    Evaluate model with Matryoshka representation learning across all granularities.
+    Evaluate model with Matryoshka representation learning across all granularities,
+    including Neural Collapse metrics (NC1, NC2) for each embedding dimension.
     Returns metrics for each nesting dimension and overall metrics.
     """
     if dist.get_rank() != 0:
@@ -264,8 +212,35 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
     # Initialize metrics storage
     if is_mrl_model and not mrl_efficient:
         granularity_metrics = {dim: {'preds': [], 'labels': [], 'losses': []} for dim in nesting_list}
+        # Initialize neural collapse accumulators for each dimension
+        if NC_AVAILABLE:
+            nc_accumulators = {
+                dim: {
+                    'mean_acc': MeanAccumulator(args.num_labels, dim, device, torch.float32),
+                    'var_acc': VarNormAccumulator(args.num_labels, dim, device, torch.float32),
+                    'embeddings': [],  # Store all embeddings for this dimension
+                    'labels': []  # Store all labels
+                } for dim in nesting_list
+            }
+        else:
+            nc_accumulators = {}
     else:
         granularity_metrics = {'full': {'preds': [], 'labels': [], 'losses': []}}
+        if NC_AVAILABLE:
+            # For non-MRL or efficient MRL models
+            hidden_size = getattr(student_model, 'hidden_size', 768)
+            if hasattr(student_model, 'config') and hasattr(student_model.config, 'hidden_size'):
+                hidden_size = student_model.config.hidden_size
+            nc_accumulators = {
+                'full': {
+                    'mean_acc': MeanAccumulator(args.num_labels, hidden_size, device, torch.float32),
+                    'var_acc': VarNormAccumulator(args.num_labels, hidden_size, device, torch.float32),
+                    'embeddings': [],
+                    'labels': []
+                }
+            }
+        else:
+            nc_accumulators = {}
     
     all_labels = []
     
@@ -274,6 +249,7 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
         labels = output_batch["labels"]
         all_labels.append(labels.cpu())
         
+        # Get model outputs
         outputs = student_model(
             input_batch["input_ids"],
             attention_mask=input_batch["attention_mask"],
@@ -281,10 +257,41 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
             labels=labels
         )
         
+        # Extract embeddings for neural collapse analysis
+        embeddings = None
+        if is_mrl_model and isinstance(outputs, dict):
+            # For MRL models, we need to get the pooled embeddings before classification
+            if hasattr(student_model, 'bert'):
+                # Get BERT outputs to extract embeddings
+                bert_outputs = student_model.bert(
+                    input_ids=input_batch["input_ids"],
+                    attention_mask=input_batch["attention_mask"],
+                    token_type_ids=input_batch.get("token_type_ids", None)
+                )
+                if hasattr(bert_outputs, 'pooler_output') and bert_outputs.pooler_output is not None:
+                    embeddings = bert_outputs.pooler_output
+                else:
+                    embeddings = bert_outputs.last_hidden_state[:, 0]  # [CLS] token
+        else:
+            # For non-MRL models, try to extract hidden states
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                embeddings = outputs.hidden_states[-1][:, 0]  # Last layer [CLS] token
+            elif hasattr(student_model, 'bert'):
+                # Fallback: get BERT embeddings directly
+                bert_outputs = student_model.bert(
+                    input_ids=input_batch["input_ids"],
+                    attention_mask=input_batch["attention_mask"],
+                    token_type_ids=input_batch.get("token_type_ids", None)
+                )
+                if hasattr(bert_outputs, 'pooler_output') and bert_outputs.pooler_output is not None:
+                    embeddings = bert_outputs.pooler_output
+                else:
+                    embeddings = bert_outputs.last_hidden_state[:, 0]
+        
+        # Process logits and collect neural collapse data
         if is_mrl_model and isinstance(outputs, dict) and 'logits' in outputs:
             # MRL model: handle multiple logits
             logits_dict = outputs['logits']
-            total_loss = outputs.get('loss', 0)
             
             if not mrl_efficient:
                 # Regular MRL: evaluate each granularity
@@ -300,6 +307,15 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
                         granularity_metrics[dim]['preds'].append(preds.cpu())
                         granularity_metrics[dim]['labels'].append(labels.cpu())
                         granularity_metrics[dim]['losses'].append(individual_loss.item())
+                        
+                        # Collect neural collapse data for this dimension
+                        if NC_AVAILABLE and embeddings is not None:
+                            # Truncate embeddings to current dimension
+                            truncated_embeddings = embeddings[:, :dim].detach()
+                            
+                            # Store the batch of embeddings and labels
+                            nc_accumulators[dim]['embeddings'].append(truncated_embeddings)
+                            nc_accumulators[dim]['labels'].append(labels)
             else:
                 # Efficient MRL: only one logits
                 logits = list(logits_dict.values())[0]
@@ -309,6 +325,12 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
                 granularity_metrics['full']['preds'].append(preds.cpu())
                 granularity_metrics['full']['labels'].append(labels.cpu())
                 granularity_metrics['full']['losses'].append(loss.item())
+                
+                # Collect neural collapse data
+                if NC_AVAILABLE and embeddings is not None:
+                    embeddings_detached = embeddings.detach()
+                    nc_accumulators['full']['embeddings'].append(embeddings_detached)
+                    nc_accumulators['full']['labels'].append(labels)
         else:
             # Regular model: single logits
             logits = outputs.logits if hasattr(outputs, 'logits') else outputs
@@ -321,11 +343,17 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
             granularity_metrics['full']['preds'].append(preds.cpu())
             granularity_metrics['full']['labels'].append(labels.cpu())
             granularity_metrics['full']['losses'].append(loss.item())
+            
+            # Collect neural collapse data
+            if NC_AVAILABLE and embeddings is not None:
+                embeddings_detached = embeddings.detach()
+                nc_accumulators['full']['embeddings'].append(embeddings_detached)
+                nc_accumulators['full']['labels'].append(labels)
 
     # Concatenate all predictions and labels
     all_labels = torch.cat(all_labels, dim=0).numpy()
     
-    # Compute metrics for each granularity
+    # Compute standard metrics for each granularity
     results = {}
     overall_metrics = {'loss': 0, 'accuracy': 0, 'precision': 0, 'recall': 0}
     num_granularities = 0
@@ -356,8 +384,153 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
             overall_metrics['precision'] += precision
             overall_metrics['recall'] += recall
             num_granularities += 1
-            
-            print(f"Evaluated {split} - Granularity {gran_key}: {metrics}")
+    
+    # Compute Neural Collapse metrics for each granularity
+    if NC_AVAILABLE and nc_accumulators:
+        print(f"\nComputing Neural Collapse metrics for {split}...")
+        
+        for gran_key, nc_data in nc_accumulators.items():
+            if nc_data['embeddings']:  # Check if we have data
+                print(f"Computing NC metrics for granularity {gran_key}...")
+                
+                # Concatenate all embeddings and labels for this granularity
+                all_embeddings = torch.cat(nc_data['embeddings'], dim=0)  # (N, D)
+                all_nc_labels = torch.cat(nc_data['labels'], dim=0)  # (N,)
+                
+                # First pass: accumulate means
+                print(f"  Accumulating means for {all_embeddings.shape[0]} samples...")
+                for emb_batch, lbl_batch in zip(nc_data['embeddings'], nc_data['labels']):
+                    # Process the batch as-is (already 2D: batch_size x dim)
+                    nc_data['mean_acc'].accumulate(emb_batch, lbl_batch)
+                
+                # Compute class means (M) and global mean (mG)
+                M, mG = nc_data['mean_acc'].compute()
+                print(f"  Computed means: M shape {M.shape}, mG shape {mG.shape}")
+                
+                # Filter out classes with too few samples if needed
+                min_samples_per_class = getattr(args, 'min_samples_per_class', 10)
+                valid_classes = nc_data['mean_acc'].ns_samples >= min_samples_per_class
+                num_valid_classes = valid_classes.sum().item()
+                
+                if num_valid_classes < args.num_labels:
+                    print(f"  Warning: Only {num_valid_classes}/{args.num_labels} classes have >= {min_samples_per_class} samples")
+                    
+                    if num_valid_classes < 2:
+                        print(f"  Skipping NC metrics: need at least 2 valid classes, got {num_valid_classes}")
+                        nc_metrics = {
+                            'nc1_cdnv': None,
+                            'nc2_norms_mean': None,
+                            'nc2_norms_var': None,
+                            'nc2_etf_error': None,
+                            'nc2_interference_mean': None,
+                            'nc2_interference_var': None,
+                            'nc_valid_classes': num_valid_classes
+                        }
+                        if f'granularity_{gran_key}' in results:
+                            results[f'granularity_{gran_key}'].update(nc_metrics)
+                        continue
+                    
+                    # Filter to valid classes
+                    M = M[valid_classes]
+                    valid_class_indices = torch.where(valid_classes)[0]
+                    
+                    # Filter embeddings and labels to only include valid classes
+                    mask = torch.zeros(all_nc_labels.shape[0], dtype=torch.bool)
+                    for valid_idx in valid_class_indices:
+                        mask |= (all_nc_labels == valid_idx)
+                    
+                    all_embeddings = all_embeddings[mask]
+                    all_nc_labels = all_nc_labels[mask]
+                    
+                    # Remap labels to 0, 1, 2, ... for valid classes
+                    label_mapping = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(valid_class_indices)}
+                    remapped_labels = torch.tensor([label_mapping[label.item()] for label in all_nc_labels], device=device)
+                    
+                    # Create new filtered data lists for variance computation
+                    filtered_embeddings = []
+                    filtered_labels = []
+                    for emb_batch, lbl_batch in zip(nc_data['embeddings'], nc_data['labels']):
+                        batch_mask = torch.zeros(lbl_batch.shape[0], dtype=torch.bool)
+                        for valid_idx in valid_class_indices:
+                            batch_mask |= (lbl_batch == valid_idx)
+                        if batch_mask.any():
+                            filtered_emb = emb_batch[batch_mask]
+                            filtered_lbl = lbl_batch[batch_mask]
+                            # Remap labels
+                            remapped_batch_labels = torch.tensor([label_mapping[l.item()] for l in filtered_lbl], device=device)
+                            filtered_embeddings.append(filtered_emb)
+                            filtered_labels.append(remapped_batch_labels)
+                    
+                    # Reset and recompute variance with filtered data
+                    nc_data['var_acc'].n_classes = num_valid_classes
+                    nc_data['var_acc'].totals = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.float32).to(device)
+                    nc_data['var_acc'].ns_samples = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.int32).to(device)
+                else:
+                    # All classes are valid, use original data
+                    filtered_embeddings = nc_data['embeddings']
+                    filtered_labels = nc_data['labels']
+                
+                try:
+                    # Second pass: accumulate variances
+                    print(f"  Accumulating variances...")
+                    for emb_batch, lbl_batch in zip(filtered_embeddings, filtered_labels):
+                        nc_data['var_acc'].accumulate(emb_batch, lbl_batch, M)
+                    
+                    # Compute variance norms
+                    V = nc_data['var_acc'].compute()
+                    print(f"  Computed variance norms: V shape {V.shape}")
+                    
+                    # NC1: Within-class variability (CDNV)
+                    cdnv = variability_cdnv(V, M, 2, getattr(args, 'tile_size', 1024))
+                    
+                    # NC2: Mean norms (Equinorm property)
+                    norms_stats = mean_norms(M, mG)
+                    norms_mean = norms_stats.mean().item()
+                    norms_var = norms_stats.var().item()
+                    
+                    # NC2: Interference/ETF error (Simplex ETF property)
+                    etf_error = simplex_etf_error(M, mG)
+                    interference_stats = interference_grid(M, mG)
+                    interference_mean = interference_stats.mean().item()
+                    interference_var = interference_stats.var().item()
+                    
+                    # Add NC metrics to results
+                    nc_metrics = {
+                        'nc1_cdnv': round(cdnv, 6) if not torch.isnan(torch.tensor(cdnv)) else None,
+                        'nc2_norms_mean': round(norms_mean, 6),
+                        'nc2_norms_var': round(norms_var, 6),
+                        'nc2_etf_error': round(etf_error, 6) if not torch.isnan(torch.tensor(etf_error)) else None,
+                        'nc2_interference_mean': round(interference_mean, 6),
+                        'nc2_interference_var': round(interference_var, 6),
+                        'nc_valid_classes': num_valid_classes
+                    }
+                    
+                    # Add to results
+                    if f'granularity_{gran_key}' in results:
+                        results[f'granularity_{gran_key}'].update(nc_metrics)
+                    else:
+                        results[f'granularity_{gran_key}'] = nc_metrics
+                    
+                    print(f"  NC1 (CDNV): {nc_metrics['nc1_cdnv']}")
+                    print(f"  NC2 (Norms): mean={nc_metrics['nc2_norms_mean']}, var={nc_metrics['nc2_norms_var']}")
+                    print(f"  NC2 (ETF error): {nc_metrics['nc2_etf_error']}")
+                    print(f"  NC2 (Interference): mean={nc_metrics['nc2_interference_mean']}, var={nc_metrics['nc2_interference_var']}")
+                    
+                except Exception as e:
+                    import traceback
+                    print(f"  Error computing NC metrics for {gran_key}: {e}")
+                    print(f"  Full traceback: {traceback.format_exc()}")
+                    nc_metrics = {
+                        'nc1_cdnv': None,
+                        'nc2_norms_mean': None,
+                        'nc2_norms_var': None,
+                        'nc2_etf_error': None,
+                        'nc2_interference_mean': None,
+                        'nc2_interference_var': None,
+                        'nc_valid_classes': 0
+                    }
+                    if f'granularity_{gran_key}' in results:
+                        results[f'granularity_{gran_key}'].update(nc_metrics)
     
     # Compute overall metrics (average across granularities)
     if num_granularities > 0:
@@ -367,25 +540,47 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
         results['overall'] = overall_metrics
         print(f"Evaluated {split} - Overall: {overall_metrics}")
     
-    # Print summary table
+    # Print comprehensive summary table
     if is_mrl_model and not mrl_efficient:
-        print(f"\n{'='*60}")
-        print(f"MRL Evaluation Summary for {split.upper()}")
-        print(f"{'='*60}")
-        print(f"{'Granularity':<12} {'Loss':<8} {'Accuracy':<10} {'Precision':<10} {'Recall':<8}")
-        print(f"{'-'*60}")
+        print(f"\n{'='*120}")
+        print(f"MRL + Neural Collapse Evaluation Summary for {split.upper()}")
+        print(f"{'='*120}")
+        header = f"{'Dim':<6} {'Loss':<8} {'Acc':<8} {'Prec':<8} {'Rec':<8}"
+        if NC_AVAILABLE:
+            header += f" {'NC1(CDNV)':<10} {'NC2(Norm)':<10} {'NC2(ETF)':<10} {'NC2(Interf)':<12} {'ValidCls':<8}"
+        print(header)
+        print(f"{'-'*120}")
         
         for dim in nesting_list:
             key = f'granularity_{dim}'
             if key in results:
                 metrics = results[key]
-                print(f"{dim:<12} {metrics['loss']:<8.4f} {metrics['accuracy']:<10.4f} "
-                      f"{metrics['precision']:<10.4f} {metrics['recall']:<8.4f}")
+                row = f"{dim:<6} {metrics['loss']:<8.4f} {metrics['accuracy']:<8.4f} " \
+                      f"{metrics['precision']:<8.4f} {metrics['recall']:<8.4f}"
+                
+                if NC_AVAILABLE:
+                    cdnv = metrics.get('nc1_cdnv', 'N/A')
+                    norms = metrics.get('nc2_norms_mean', 'N/A')
+                    etf = metrics.get('nc2_etf_error', 'N/A')
+                    interf = metrics.get('nc2_interference_mean', 'N/A')
+                    valid_cls = metrics.get('nc_valid_classes', 'N/A')
+                    
+                    cdnv_str = f"{cdnv:.4f}" if isinstance(cdnv, (int, float)) and cdnv is not None else str(cdnv)
+                    norms_str = f"{norms:.4f}" if isinstance(norms, (int, float)) and norms is not None else str(norms)
+                    etf_str = f"{etf:.4f}" if isinstance(etf, (int, float)) and etf is not None else str(etf)
+                    interf_str = f"{interf:.4f}" if isinstance(interf, (int, float)) and interf is not None else str(interf)
+                    
+                    row += f" {cdnv_str:<10} {norms_str:<10} {etf_str:<10} {interf_str:<12} {valid_cls:<8}"
+                
+                print(row)
         
-        print(f"{'-'*60}")
-        print(f"{'Overall':<12} {overall_metrics['loss']:<8.4f} {overall_metrics['accuracy']:<10.4f} "
-              f"{overall_metrics['precision']:<10.4f} {overall_metrics['recall']:<8.4f}")
-        print(f"{'='*60}\n")
+        print(f"{'-'*120}")
+        row = f"{'Avg':<6} {overall_metrics['loss']:<8.4f} {overall_metrics['accuracy']:<8.4f} " \
+              f"{overall_metrics['precision']:<8.4f} {overall_metrics['recall']:<8.4f}"
+        if NC_AVAILABLE:
+            row += f" {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<12} {'N/A':<8}"
+        print(row)
+        print(f"{'='*120}\n")
 
     student_model.train()
     return results
@@ -394,8 +589,9 @@ def evaluate_mrl(args, tokenizer, student_model, dataset, split, device):
 def evaluate(args, tokenizer, student_model, dataset, split, device):
     """
     Legacy evaluation function for backward compatibility.
+    Now calls the enhanced MRL evaluation with Neural Collapse metrics.
     """
-    results = evaluate_mrl(args, tokenizer, student_model, dataset, split, device)
+    results = evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
     if results is None:
         return None, None, None, None
     
@@ -466,7 +662,7 @@ def main():
         finetune(args, distiller.student_tokenizer, model_engine, optimizer, lr_scheduler, dataset, device)
        
     if args.do_eval:
-        evaluate_mrl(args, distiller.student_tokenizer, model_engine.module.student_model, dataset["test"], "test", device)
+        evaluate_mrl_with_nc(args, distiller.student_tokenizer, model_engine.module.student_model, dataset["test"], "test", device)
         
     
 if __name__ == "__main__":
