@@ -98,18 +98,51 @@ def mean_norms(M: Tensor, m_G: Tensor = 0, post_funcs: List[callable] = []) -> T
     return result
 
 
-def interference_grid(M: Tensor, m_G: Tensor = 0) -> Tensor:
+def interference_grid(M: Tensor, m_G: Tensor = 0, exclude_diagonal: bool = False) -> Tensor:
     """Compute the pairwise interference grid between (mean) embeddings.
 
     Arguments:
         M (Tensor): The matrix of feature (or class mean) embeddings.
         m_G (Tensor, optional): Bias (e.g. global mean) vector. Defaults to 0.
+        exclude_diagonal (bool, optional): Whether to zero out diagonal elements 
+            for statistical computations. Defaults to False for backward compatibility.
 
     Returns:
         Tensor: A matrix representing pairwise interferences.
     """
     M_centred = M - m_G
-    return pt.inner(M_centred, M_centred)  # (K,K)
+    interference = pt.inner(M_centred, M_centred)  # (K,K)
+    
+    if exclude_diagonal:
+        # Zero out diagonal elements for statistics computation
+        mask = ~pt.eye(interference.shape[0], dtype=bool, device=interference.device)
+        interference = interference * mask.float()
+    
+    return interference
+
+
+def interference_stats(M: Tensor, m_G: Tensor = 0) -> tuple:
+    """Compute statistics of pairwise interference, excluding diagonal elements.
+    
+    Arguments:
+        M (Tensor): The matrix of feature (or class mean) embeddings.
+        m_G (Tensor, optional): Bias (e.g. global mean) vector. Defaults to 0.
+        
+    Returns:
+        tuple: (mean, variance) of off-diagonal interference values.
+    """
+    M_centred = M - m_G
+    interference = pt.inner(M_centred, M_centred)  # (K,K)
+    
+    # Extract only off-diagonal elements for statistics
+    K = interference.shape[0]
+    mask = ~pt.eye(K, dtype=bool, device=interference.device)
+    off_diagonal = interference[mask]  # (K*(K-1),)
+    
+    mean_val = off_diagonal.mean()
+    var_val = off_diagonal.var()
+    
+    return mean_val.item(), var_val.item()
 
 
 def similarities(W: Tensor, M: Tensor, m_G: Tensor = 0, cos: bool = False) -> Tensor:
