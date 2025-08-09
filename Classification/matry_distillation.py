@@ -174,7 +174,7 @@ try:
     from neural_collapse.measure import (
         variability_cdnv, 
         mean_norms, 
-        interference_grid, 
+        interference_stats,  # Changed from interference_grid
         simplex_etf_error
     )
     from neural_collapse.accumulate import MeanAccumulator, VarNormAccumulator
@@ -489,12 +489,27 @@ def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
                     norms_var = norms_stats.var().item()
                     
                     # NC2: Interference/ETF error (Simplex ETF property)
+                    # etf_error = simplex_etf_error(M, mG)
+                    # interference_stats = interference_grid(M, mG)
+                    # interference_mean = interference_stats.mean().item()
+                    # interference_var = interference_stats.var().item()
+
+                    # NC2: Interference/ETF error (Simplex ETF property)
                     etf_error = simplex_etf_error(M, mG)
-                    interference_stats = interference_grid(M, mG)
-                    interference_mean = interference_stats.mean().item()
-                    interference_var = interference_stats.var().item()
+                    # Use the new interference_stats function instead of interference_grid
+                    interference_mean, interference_var = interference_stats(M, mG)
                     
                     # Add NC metrics to results
+                    # nc_metrics = {
+                    #     'nc1_cdnv': round(cdnv, 6) if not torch.isnan(torch.tensor(cdnv)) else None,
+                    #     'nc2_norms_mean': round(norms_mean, 6),
+                    #     'nc2_norms_var': round(norms_var, 6),
+                    #     'nc2_etf_error': round(etf_error, 6) if not torch.isnan(torch.tensor(etf_error)) else None,
+                    #     'nc2_interference_mean': round(interference_mean, 6),
+                    #     'nc2_interference_var': round(interference_var, 6),
+                    #     'nc_valid_classes': num_valid_classes
+                    # }
+
                     nc_metrics = {
                         'nc1_cdnv': round(cdnv, 6) if not torch.isnan(torch.tensor(cdnv)) else None,
                         'nc2_norms_mean': round(norms_mean, 6),
