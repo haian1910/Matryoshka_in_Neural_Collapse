@@ -193,6 +193,20 @@ class VarNormAccumulator(Accumulator):
 
         return self.ns_samples, self.totals
 
+    def compute(self, idxs: List[int] = None) -> Tensor:
+        """Override the base compute method to return only variance norms.
+        
+        Returns:
+            Tensor: Per-class variance norms (K,) instead of tuple.
+        """
+        ns_samples, totals = self.ns_samples, self.totals  # (K), (K)
+        if idxs is not None:
+            ns_samples, totals = ns_samples[idxs], totals[idxs]  # (K'), (K')
+
+        eps = pt.finfo(self.dtype).eps
+        variance_norms = totals / (ns_samples + eps).to(self.dtype)  # (K)
+        return variance_norms
+
 
 class DecAccumulator(Accumulator):
     """Accumulator that computes decision hits from multiple classifiers.
