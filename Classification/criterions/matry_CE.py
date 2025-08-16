@@ -29,7 +29,7 @@ class Matry_CrossEntropyLoss(nn.Module):
         self.label_smoothing = args.label_smoothing
         
         # MRL specific parameters
-        self.nesting_list = getattr(args, 'mrl_nesting_list', [64, 128, 256, 512, 768])
+        self.nesting_list = getattr(args, 'mrl_nesting_list', [128, 256, 512, 768])
         self.mrl_efficient = getattr(args, 'mrl_efficient', False)
         
         # Relative importance weights for different nesting dimensions
