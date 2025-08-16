@@ -393,9 +393,11 @@ def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
             if nc_data['embeddings']:  # Check if we have data
                 print(f"Computing NC metrics for granularity {gran_key}...")
                 
-                # Concatenate all embeddings and labels for this granularity
                 all_embeddings = torch.cat(nc_data['embeddings'], dim=0)  # (N, D)
                 all_nc_labels = torch.cat(nc_data['labels'], dim=0)  # (N,)
+                
+                # Ensure all_nc_labels is on the same device as other tensors
+                all_nc_labels = all_nc_labels.to(device)
                 
                 # First pass: accumulate means
                 print(f"  Accumulating means for {all_embeddings.shape[0]} samples...")
@@ -435,7 +437,7 @@ def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
                     valid_class_indices = torch.where(valid_classes)[0]
                     
                     # Filter embeddings and labels to only include valid classes
-                    mask = torch.zeros(all_nc_labels.shape[0], dtype=torch.bool)
+                    mask = torch.zeros(all_nc_labels.shape[0], dtype=torch.bool, device=device)
                     for valid_idx in valid_class_indices:
                         mask |= (all_nc_labels == valid_idx)
                     
@@ -450,7 +452,9 @@ def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
                     filtered_embeddings = []
                     filtered_labels = []
                     for emb_batch, lbl_batch in zip(nc_data['embeddings'], nc_data['labels']):
-                        batch_mask = torch.zeros(lbl_batch.shape[0], dtype=torch.bool)
+                        # Ensure batch labels are on correct device
+                        lbl_batch = lbl_batch.to(device)
+                        batch_mask = torch.zeros(lbl_batch.shape[0], dtype=torch.bool, device=device)
                         for valid_idx in valid_class_indices:
                             batch_mask |= (lbl_batch == valid_idx)
                         if batch_mask.any():
@@ -463,8 +467,8 @@ def evaluate_mrl_with_nc(args, tokenizer, student_model, dataset, split, device)
                     
                     # Reset and recompute variance with filtered data
                     nc_data['var_acc'].n_classes = num_valid_classes
-                    nc_data['var_acc'].totals = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.float32).to(device)
-                    nc_data['var_acc'].ns_samples = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.int32).to(device)
+                    nc_data['var_acc'].totals = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.float32, device=device)
+                    nc_data['var_acc'].ns_samples = torch.zeros(nc_data['var_acc'].n_classes, dtype=torch.int32, device=device)
                 else:
                     # All classes are valid, use original data
                     filtered_embeddings = nc_data['embeddings']
