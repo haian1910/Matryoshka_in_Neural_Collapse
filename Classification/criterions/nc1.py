@@ -14,11 +14,11 @@ class OrthogonalProjection(nn.Module):
             nn.init.orthogonal_(self.projector.weight)
 
     def forward(self, x):
-        # Handle dtype conversion for orthogonal constraint if needed
-        original_dtype = x.dtype
+        # Handle dtype conversion - ensure projector weights match input dtype
+        if x.dtype != self.projector.weight.dtype:
+            # Convert projector weights to match input dtype
+            self.projector.weight.data = self.projector.weight.data.to(x.dtype)
         
-        # If input is bfloat16, we can work directly with it
-        # The linear layer will handle the computation
         return self.projector(x)
         
     def orthogonal_regularization_loss(self):
@@ -49,7 +49,7 @@ class NC1(Matry_CrossEntropyLoss):
         
         # Initialize projection matrices for each nesting dimension
         # Assuming teacher has hidden size 4096 (from LLM2Vec-Mistral-7B)
-        self.teacher_hidden_size = 2048
+        self.teacher_hidden_size = 4096
         self.projectors = nn.ModuleDict()
         
         for dim in self.nesting_list:
@@ -57,6 +57,18 @@ class NC1(Matry_CrossEntropyLoss):
                 in_dim=dim, 
                 out_dim=self.teacher_hidden_size
             )
+    
+    def to(self, device, dtype=None):
+        """Override to method to ensure projectors are moved to the correct device and dtype"""
+        super().to(device, dtype=dtype)
+        self.projectors.to(device, dtype=dtype)
+        return self
+    
+    def cuda(self, device=None):
+        """Override cuda method to ensure projectors are moved to CUDA"""
+        super().cuda(device)
+        self.projectors.cuda(device)
+        return self
     
     def forward(
         self, 
@@ -108,7 +120,7 @@ class NC1(Matry_CrossEntropyLoss):
         
         # Compute distillation loss
         kd_loss, log = self.compute_nc1_loss(
-            model_outputs, teacher_outputs, output_data,input_data, distiller, log
+            model_outputs, teacher_outputs, output_data, input_data, distiller, log
         )
         print("nc1_loss:", kd_loss)
         
@@ -130,16 +142,16 @@ class NC1(Matry_CrossEntropyLoss):
         return loss, logging_output
 
     def compute_nc1_loss(
-        self, model_outputs, teacher_outputs, output_data,input_data, distiller, log
+        self, model_outputs, teacher_outputs, output_data, input_data, distiller, log
     ):
         """
         Compute NC1 distillation loss following the mathematical formulation:
         
         For each student subnet dimension d1:
-        1. Get student embedding Z_S^{d1} ∈ R^{n×d1}
-        2. Project to teacher space: Ẑ_S^{d1} = Z_S^{d1} P^{d1}
-        3. Compute MSE loss: L_nc1-distill^{d1} = (1/n) Σ ||ẑ_{S,i}^{d1} - z_{T,i}||_2^2
-        4. Sum over all dimensions: L_nc1-distill = Σ L_nc1-distill^{d1}
+        1. Get student embedding Z_S^{d1} âˆˆ R^{nÃ—d1}
+        2. Project to teacher space: áº_S^{d1} = Z_S^{d1} P^{d1}
+        3. Compute MSE loss: L_nc1-distill^{d1} = (1/n) Î£ ||áº'_{S,i}^{d1} - z_{T,i}||_2^2
+        4. Sum over all dimensions: L_nc1-distill = Î£ L_nc1-distill^{d1}
         """
         
         # Get teacher embeddings (Z_T)
@@ -187,9 +199,20 @@ class NC1(Matry_CrossEntropyLoss):
             else:
                 raise ValueError("Cannot extract student embeddings")
         
+        # Ensure full_student_embeddings is on the correct device and dtype
+        device = next(distiller.student_model.parameters()).device
+        target_dtype = next(distiller.student_model.parameters()).dtype
+        
+        full_student_embeddings = full_student_embeddings.to(device=device, dtype=target_dtype)
+        teacher_embeddings = teacher_embeddings.to(device=device, dtype=target_dtype)
+        
         # Create student embeddings for each nesting dimension by truncating
         for dim in self.nesting_list:
             student_embeddings_dict[dim] = full_student_embeddings[:, :dim]  # [batch_size, dim]
+        
+        # Ensure projectors are on the correct device and dtype
+        if not next(self.projectors.parameters()).device == device:
+            self.projectors.to(device=device, dtype=target_dtype)
         
         # Compute NC1 distillation loss
         total_nc1_loss = 0.0
@@ -199,27 +222,30 @@ class NC1(Matry_CrossEntropyLoss):
             # Get student embeddings for this dimension: Z_S^{d1}
             student_emb = student_embeddings_dict[dim]  # [batch_size, dim]
             
+            # Ensure student embeddings are on correct device and dtype
+            student_emb = student_emb.to(device=device, dtype=target_dtype)
+            
             # Get projection matrix: P^{d1}
             projector = self.projectors[f'proj_{dim}']
             
-            # Project student embeddings to teacher space: Ẑ_S^{d1} = Z_S^{d1} P^{d1}
+            # Project student embeddings to teacher space: áº_S^{d1} = Z_S^{d1} P^{d1}
             projected_student_emb = projector(student_emb)  # [batch_size, teacher_hidden_size]
             
-            # Compute MSE loss: L_nc1-distill^{d1} = (1/n) Σ ||ẑ_{S,i}^{d1} - z_{T,i}||_2^2
+            # Compute MSE loss: L_nc1-distill^{d1} = (1/n) Î£ ||áº'_{S,i}^{d1} - z_{T,i}||_2^2
             mse_loss = nn.MSELoss()(projected_student_emb, teacher_embeddings)
             
             # Add to total loss
             total_nc1_loss += mse_loss
-            nc1_losses_per_dim[f'nc1_loss_dim_{dim}'] = mse_loss.item()
+            nc1_losses_per_dim[f'nc1_loss_dim_{dim}'] = mse_loss.detach()  # Keep as tensor
             
             # Optional: Add orthogonal regularization
             if hasattr(self, 'use_ortho_reg') and self.use_ortho_reg:
                 ortho_loss = projector.orthogonal_regularization_loss()
                 total_nc1_loss += 1 * ortho_loss  # Small weight for regularization
         
-        # Update log with individual dimension losses
+        # Update log with individual dimension losses (keep as tensors)
         log.update(nc1_losses_per_dim)
-        log['nc1_loss_total'] = total_nc1_loss.item()
+        log['nc1_loss_total'] = total_nc1_loss.detach()  # Keep as tensor
         
         return total_nc1_loss, log
 
