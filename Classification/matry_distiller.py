@@ -309,7 +309,7 @@ class Distiller(nn.Module):
             )
             
             # Get MRL nesting list from args or use default
-            nesting_list = getattr(self.args, 'mrl_nesting_list', [64, 128, 256, 512, 768])
+            nesting_list = getattr(self.args, 'mrl_nesting_list', [128, 256, 512, 768])
             mrl_efficient = getattr(self.args, 'mrl_efficient', False)
             
             # Ensure the largest nesting size doesn't exceed hidden size
