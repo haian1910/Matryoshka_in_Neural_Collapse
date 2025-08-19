@@ -1,11 +1,12 @@
 scikit-learn
 scipy
 matplotlib
-deepspeed==0.16.5
-peft==0.15.1
 editdistance==0.8.1
 pandas
 llm2vec
-sentence_transformers==4.1.0
-transformers==4.51.3
 flash-attn
+torch==2.6.0
+transformers==4.55.2
+datasets==4.0.0
+peft==0.17.0
+deepspeed==0.17.4
