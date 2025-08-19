@@ -5,7 +5,7 @@ from typing import List, Dict
 from .matry_CE import Matry_CrossEntropyLoss
 
 class OrthogonalProjection(nn.Module):
-    def __init__(self, in_dim=768, out_dim=4096):
+    def __init__(self, in_dim=768, out_dim=1024):
         super(OrthogonalProjection, self).__init__()
         # Create a regular linear layer first
         self.projector = nn.Linear(in_dim, out_dim, bias=False)
@@ -48,8 +48,8 @@ class NC1(Matry_CrossEntropyLoss):
         self.mrl_efficient = getattr(args, 'mrl_efficient', False)
         
         # Initialize projection matrices for each nesting dimension
-        # Assuming teacher has hidden size 4096 (from LLM2Vec-Mistral-7B)
-        self.teacher_hidden_size = 4096
+        # Assuming teacher has hidden size 1024
+        self.teacher_hidden_size = 1024
         self.projectors = nn.ModuleDict()
         
         for dim in self.nesting_list:
@@ -148,10 +148,10 @@ class NC1(Matry_CrossEntropyLoss):
         Compute NC1 distillation loss following the mathematical formulation:
         
         For each student subnet dimension d1:
-        1. Get student embedding Z_S^{d1} âˆˆ R^{nÃ—d1}
-        2. Project to teacher space: áº_S^{d1} = Z_S^{d1} P^{d1}
-        3. Compute MSE loss: L_nc1-distill^{d1} = (1/n) Î£ ||áº'_{S,i}^{d1} - z_{T,i}||_2^2
-        4. Sum over all dimensions: L_nc1-distill = Î£ L_nc1-distill^{d1}
+        1. Get student embedding 
+        2. Project to teacher space
+        3. Compute MSE loss
+        4. Sum over all dimensions
         """
         
         # Get teacher embeddings (Z_T)
@@ -219,19 +219,19 @@ class NC1(Matry_CrossEntropyLoss):
         nc1_losses_per_dim = {}
         
         for dim in self.nesting_list:
-            # Get student embeddings for this dimension: Z_S^{d1}
+            # Get student embeddings for this dimension
             student_emb = student_embeddings_dict[dim]  # [batch_size, dim]
             
             # Ensure student embeddings are on correct device and dtype
             student_emb = student_emb.to(device=device, dtype=target_dtype)
             
-            # Get projection matrix: P^{d1}
+            # Get projection matrix
             projector = self.projectors[f'proj_{dim}']
             
-            # Project student embeddings to teacher space: áº_S^{d1} = Z_S^{d1} P^{d1}
+            # Project student embeddings to teacher space
             projected_student_emb = projector(student_emb)  # [batch_size, teacher_hidden_size]
             
-            # Compute MSE loss: L_nc1-distill^{d1} = (1/n) Î£ ||áº'_{S,i}^{d1} - z_{T,i}||_2^2
+            # Compute MSE loss
             mse_loss = nn.MSELoss()(projected_student_emb, teacher_embeddings)
             
             # Add to total loss
