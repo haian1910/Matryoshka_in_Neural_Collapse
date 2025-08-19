@@ -15,22 +15,22 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=/xxx/Dynamic_mapping_Distillation
-CKPT_NAME="LLM2Vec"
+BASE_PATH=/Matryoshka_in_Neural_Collapse
+CKPT_NAME="QWEN"
 CKPT_PATH="${BASE_PATH}/model_hub/${CKPT_NAME}"
 # data
-DATA_DIR="${BASE_PATH}/data/imdb/"
-NUM_LABELS=2
+DATA_DIR="${BASE_PATH}/data/patent/"
+NUM_LABELS=9
 # task
 TASK="sft"
 # hp
-BATCH_SIZE=2
+BATCH_SIZE=16
 LR=0.00001
 GRAD_ACC=1
-EVAL_BATCH_SIZE=2
-EPOCH=2
+EVAL_BATCH_SIZE=16
+EPOCH=5
 LORA_RANK=256
-LORA_ALPHA=16
+LORA_ALPHA=8
 LORA_DROPOUT=0.1
 # length
 MAX_LENGTH=512
@@ -92,20 +92,13 @@ OPTS+=" --seed ${SEED}"
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_test.json"
 
-# if [[ $PRECISION == "bf16" ]]; then
-#     OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_bf16.json"
-# elif [[ $PRECISION == "fp16" ]]; then
-#     OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
-# elif [[ $PRECISION == "fp32" ]]; then
-#     OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_fp32.json"
-# fi
 
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3
 export PYTHONPATH=${BASE_PATH}
-CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/distillation.py ${OPTS}"
+CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/QWEN_distillation.py ${OPTS}"
 
 echo ${CMD}
 # ${CMD}

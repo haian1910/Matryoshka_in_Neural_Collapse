@@ -15,35 +15,27 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=/xxx/Dynamic_mapping_Distillation
+BASE_PATH=/Matryoshka_in_Neural_Collapse
 CKPT_NAME="bert"
 CKPT_PATH="${BASE_PATH}/model_hub/${CKPT_NAME}"
-TEACHER_MODEL_NAME="LLM2Vec"
-TEACHER_MODEL_PATH="${BASE_PATH}/model_hub/${TEACHER_MODEL_NAME}" # GẮN LINK MODEL CHECKPOINT VÀO ĐÂY
 # data
-DATA_DIR="${BASE_PATH}/data/imdb/"
-NUM_LABELS=2
+DATA_DIR="${BASE_PATH}/data/patent/"
+NUM_LABELS=9
 # task
-TASK="dual_space_kd_with_cross_model_attention"
+TASK="sft"
 # hp
-BATCH_SIZE=4
+BATCH_SIZE=16
 LR=0.00001
 GRAD_ACC=1
-EVAL_BATCH_SIZE=4
-EPOCH=2
-KD_RATE=0.5
-KD_TEMP=2.0
+EVAL_BATCH_SIZE=32
+EPOCH=5
 # length
 MAX_LENGTH=512
-# distiller
-PROJECTOR_CONFIG_PATH="${BASE_PATH}/configs/projector_config.json"
-PROJECTOR_LR=0.001
 # runtime
 PRECISION="bf16"
-CRITERION="dual_space_kd_with_cross_model_attention"
-KD_OBJ="forward_kl"  # [forward_kl, reverse_kl, js_divergence, skewed_forward_kl, skewed_reverse_kl, adaptive_kl]
-CONFIG="${KD_OBJ}"
-SETTING=criterion=${CRITERION}__${CONFIG}__teacher=${KD_RATE}__kd^temp=${KD_TEMP}__tea^temp=${TEA_TEMP}__epoch=${EPOCH}__bsz=${BATCH_SIZE}x${GRAD_ACC}x${GPUS_PER_NODE}=$((BATCH_SIZE * GRAD_ACC * GPUS_PER_NODE * NNODES))__lr=${LR}
+CRITERION="matry_CE"
+CONFIG="default-${PRECISION}"
+SETTING=criterion=${CRITERION}__${CONFIG}__epoch=${EPOCH}__bsz=${BATCH_SIZE}x${GRAD_ACC}x${GPUS_PER_NODE}=$((BATCH_SIZE * GRAD_ACC * GPUS_PER_NODE * NNODES))__lr=${LR}
 SAVE_PATH="${BASE_PATH}/outputs/${CKPT_NAME}/${TASK}/${SETTING}"
 SAVE_BEST_N_CKPTS=1
 # seed
@@ -54,12 +46,9 @@ mkdir -p ${SAVE_PATH}
 OPTS=""
 # model
 OPTS+=" --base-path ${BASE_PATH}"
-OPTS+=" --ckpt-name ${CKPT_NAME}"
 OPTS+=" --model-path ${CKPT_PATH}"
 OPTS+=" --n-gpu ${GPUS_PER_NODE}"
-OPTS+=" --teacher-model-path ${TEACHER_MODEL_PATH}"
-OPTS+=" --teacher-model-fp16"
-OPTS+=" --gradient-checkpointing"
+# OPTS+=" --gradient-checkpointing"
 # data
 OPTS+=" --data-dir ${DATA_DIR}"
 OPTS+=" --num-workers 0"
@@ -77,19 +66,12 @@ OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
 OPTS+=" --num-epochs ${EPOCH}"
-OPTS+=" --kd-rate ${KD_RATE}"
-OPTS+=" --kd-temperature ${KD_TEMP}"
-OPTS+=" --kd-objective ${KD_OBJ}"
-# distiller
-OPTS+=" --projector-lr ${PROJECTOR_LR}"
-OPTS+=" --projector-config-path ${PROJECTOR_CONFIG_PATH}"
-# OPTS+=" --projector-path ${PROJECTOR_PATH}"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
 OPTS+=" --max-prompt-length 256"
 # runtime
 OPTS+=" --do-train"
-OPTS+=" --do-eval"
+OPTS+=" --do-valid"
 OPTS+=" --save-interval 1"
 OPTS+=" --eval-interval 1"
 OPTS+=" --log-interval 50"
@@ -102,13 +84,13 @@ OPTS+=" --seed ${SEED}"
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_test.json"
 
-
-
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3
 export PYTHONPATH=${BASE_PATH}
-CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/distillation.py ${OPTS}"
+CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/QWEN_Matry_distillation.py ${OPTS}"
 
+# ${CMD}
 ${CMD} \
 >> ${SAVE_PATH}/train.log 2>&1 &
+echo "Training started, logs are being saved to ${SAVE_PATH}/train.log"
