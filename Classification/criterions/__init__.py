@@ -7,6 +7,7 @@ from .multi_level_ot import MULTI_LEVEL_OT
 from .matry_CE import Matry_CrossEntropyLoss
 from .nc1 import NC1
 from .nc2 import NC2
+from .full_nc import FULL_NC
 criterion_list = {
     "cross_entropy": CrossEntropyLoss,
     "various_divergence": VariousDivergence,
@@ -17,7 +18,8 @@ criterion_list = {
     "multi_level_ot": MULTI_LEVEL_OT,
     "matry_CE": Matry_CrossEntropyLoss,
     "nc1": NC1,
-    "nc2": NC2
+    "nc2": NC2,
+    "full_nc": FULL_NC
 }
 
 def build_criterion(args):
