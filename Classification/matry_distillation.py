@@ -2,6 +2,7 @@ import time
 import os
 
 from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
+from Classification.criterions.nc2 import NC2
 
 import torch
 import torch.nn as nn
@@ -69,6 +70,238 @@ def prepare_dataset(args, distiller):
         
     return data
 
+# Replace the compute_teacher_targets function in matry_distillation.py with this fixed version:
+
+def compute_teacher_targets(args, distiller, dataset, device):
+    """
+    Compute teacher class means and gram matrix over the full dataset.
+    This should be called after teacher training is complete and before distillation begins.
+    
+    Args:
+        args: Training arguments
+        distiller: Distiller object containing teacher and student models
+        dataset: Dataset dictionary containing train/dev/test splits
+        device: Device to run computations on
+        
+    Returns:
+        teacher_class_means: Tensor of shape [num_classes, teacher_hidden_size]
+        teacher_gram: Normalized Gram matrix of shape [num_classes, num_classes]
+    """
+    if dist.get_rank() != 0:
+        # Only compute on rank 0, then broadcast
+        return None, None
+    
+    log_rank("Computing teacher targets over full training dataset...")
+    
+    # Use training dataset for computing teacher targets
+    train_dataset = dataset["train"]
+    
+    # Create dataloader for teacher target computation
+    # Use smaller batch size to handle memory constraints
+    target_batch_size = min(args.eval_batch_size, 32)
+    
+    dataloader = DataLoader(
+        train_dataset,
+        shuffle=False,  # Don't shuffle for consistent computation
+        batch_size=target_batch_size,
+        num_workers=args.num_workers,
+        collate_fn=train_dataset.collate
+    )
+    
+    # Set teacher model to eval mode and move to device
+    teacher_model = distiller.teacher_model
+    teacher_model.eval()
+    teacher_model = teacher_model.to(device)  # Ensure teacher model is on correct device
+    
+    # Get teacher hidden size
+    teacher_hidden_size = getattr(args, 'teacher_hidden_size', 2048)
+    if hasattr(teacher_model, 'config') and hasattr(teacher_model.config, 'hidden_size'):
+        teacher_hidden_size = teacher_model.config.hidden_size
+    elif hasattr(teacher_model, 'hidden_size'):
+        teacher_hidden_size = teacher_model.hidden_size
+    
+    num_classes = args.num_labels
+    
+    # Initialize accumulators for computing class means
+    class_embeddings_sum = torch.zeros(num_classes, teacher_hidden_size, device=device, dtype=torch.float32)
+    class_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
+    
+    log_rank(f"Processing {len(dataloader)} batches for teacher target computation...")
+    
+    # First pass: accumulate embeddings for each class
+    with torch.no_grad():
+        for batch_idx, (input_batch, output_batch) in enumerate(tqdm(dataloader, desc="Computing teacher targets")):
+            # Move batch to device
+            train_dataset.move_to_device([input_batch, output_batch], device)
+            labels = output_batch["labels"]  # [batch_size]
+            
+            # Ensure teacher input tensors are on the correct device
+            teacher_input_ids = input_batch["teacher_input_ids"].to(device)
+            teacher_attention_mask = input_batch["teacher_attention_mask"].to(device)
+            
+            # Get teacher outputs with hidden states
+            teacher_outputs = teacher_model(
+                teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                output_hidden_states=True
+            )
+            
+            # Extract teacher hidden states - Handle different model architectures
+            if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states is not None:
+                # For LLM2Vec model loaded with AutoModelForSequenceClassification
+                teacher_hidden = teacher_outputs.hidden_states[-1]  # Last layer hidden states
+            elif isinstance(teacher_outputs, dict) and 'hidden_states' in teacher_outputs:
+                # If teacher_outputs is a dict with hidden_states key
+                teacher_hidden = teacher_outputs['hidden_states'][-1]
+            else:
+                raise ValueError("Cannot extract teacher hidden states")
+            
+            # Extract CLS token representation from teacher
+            if teacher_hidden.dim() == 3:  # [batch_size, sequence_length, hidden_size]
+                teacher_embeddings = teacher_hidden.mean(dim=1)  # Take mean across sequence length
+            elif teacher_hidden.dim() == 2:  # [batch_size, hidden_size] - already CLS representation
+                teacher_embeddings = teacher_hidden
+            else:
+                raise ValueError(f"Unexpected dimension for teacher_hidden: {teacher_hidden.shape}")
+            # Ensure embeddings are float32 for numerical stability
+            teacher_embeddings = teacher_embeddings.float()
+            
+            # Accumulate embeddings for each class
+            for class_idx in range(num_classes):
+                mask = (labels == class_idx)
+                if mask.sum() > 0:
+                    class_embeddings_sum[class_idx] += teacher_embeddings[mask].sum(dim=0)
+                    class_counts[class_idx] += mask.sum()
+            
+            if (batch_idx + 1) % 100 == 0:
+                log_rank(f"Processed {batch_idx + 1}/{len(dataloader)} batches")
+    
+    # Compute class means
+    # Avoid division by zero for classes with no samples
+    class_means = torch.zeros_like(class_embeddings_sum)
+    for class_idx in range(num_classes):
+        if class_counts[class_idx] > 0:
+            class_means[class_idx] = class_embeddings_sum[class_idx] / class_counts[class_idx]
+        else:
+            log_rank(f"Warning: Class {class_idx} has no samples in the training dataset")
+    
+    # Remove classes with no samples from consideration
+    valid_classes = class_counts > 0
+    valid_class_means = class_means[valid_classes]
+    num_valid_classes = valid_classes.sum().item()
+    
+    log_rank(f"Computed class means for {num_valid_classes}/{num_classes} classes")
+    log_rank(f"Class sample counts: {class_counts.tolist()}")
+    
+    if num_valid_classes == 0:
+        raise ValueError("No valid classes found in the training dataset")
+    
+    # Compute Gram matrix: G = M @ M^T where M is the class means matrix
+    # Shape: [num_valid_classes, num_valid_classes]
+    teacher_gram = torch.mm(valid_class_means, valid_class_means.t())
+    
+    # Normalize Gram matrix by Frobenius norm for numerical stability
+    gram_norm = torch.norm(teacher_gram, p='fro')
+    if gram_norm > 1e-8:
+        teacher_gram = teacher_gram / gram_norm
+    else:
+        log_rank("Warning: Teacher Gram matrix has very small norm, using unnormalized matrix")
+    
+    # If we filtered out some classes, we need to expand back to full size with zeros
+    if num_valid_classes < num_classes:
+        full_class_means = torch.zeros(num_classes, teacher_hidden_size, device=device, dtype=torch.float32)
+        full_class_means[valid_classes] = valid_class_means
+        
+        full_gram = torch.zeros(num_classes, num_classes, device=device, dtype=torch.float32)
+        valid_indices = torch.where(valid_classes)[0]
+        for i, idx_i in enumerate(valid_indices):
+            for j, idx_j in enumerate(valid_indices):
+                full_gram[idx_i, idx_j] = teacher_gram[i, j]
+        
+        teacher_class_means = full_class_means
+        teacher_gram = full_gram
+    else:
+        teacher_class_means = valid_class_means
+    
+    log_rank(f"Teacher targets computed:")
+    log_rank(f"  Class means shape: {teacher_class_means.shape}")
+    log_rank(f"  Gram matrix shape: {teacher_gram.shape}")
+    log_rank(f"  Gram matrix norm: {torch.norm(teacher_gram, p='fro').item():.6f}")
+    
+    # Save teacher targets to disk for future use
+    if args.save_dir:
+        teacher_targets_path = os.path.join(args.save_dir, "teacher_targets.pt")
+        torch.save({
+            'teacher_class_means': teacher_class_means.cpu(),
+            'teacher_gram': teacher_gram.cpu(),
+            'class_counts': class_counts.cpu(),
+            'valid_classes': valid_classes.cpu(),
+            'teacher_hidden_size': teacher_hidden_size,
+            'num_classes': num_classes
+        }, teacher_targets_path)
+        log_rank(f"Saved teacher targets to {teacher_targets_path}")
+    
+    return teacher_class_means, teacher_gram
+
+def load_or_compute_teacher_targets(args, distiller, dataset, device):
+    """
+    Load teacher targets from disk if available, otherwise compute them.
+    
+    Args:
+        args: Training arguments
+        distiller: Distiller object
+        dataset: Dataset dictionary
+        device: Device to run computations on
+        
+    Returns:
+        teacher_class_means: Tensor of shape [num_classes, teacher_hidden_size]
+        teacher_gram: Normalized Gram matrix of shape [num_classes, num_classes]
+    """
+    teacher_targets_path = os.path.join(args.save_dir, "teacher_targets.pt") if args.save_dir else None
+    
+    # Check if we should force recomputation
+    force_recompute = getattr(args, 'recompute_teacher_targets', False)
+    
+    if (not force_recompute and teacher_targets_path and 
+        os.path.exists(teacher_targets_path) and dist.get_rank() == 0):
+        
+        log_rank("Loading pre-computed teacher targets...")
+        try:
+            saved_targets = torch.load(teacher_targets_path, map_location=device)
+            teacher_class_means = saved_targets['teacher_class_means'].to(device)
+            teacher_gram = saved_targets['teacher_gram'].to(device)
+            
+            log_rank(f"Loaded teacher targets:")
+            log_rank(f"  Class means shape: {teacher_class_means.shape}")
+            log_rank(f"  Gram matrix shape: {teacher_gram.shape}")
+            
+            return teacher_class_means, teacher_gram
+        except Exception as e:
+            log_rank(f"Failed to load teacher targets: {e}")
+            log_rank("Computing teacher targets from scratch...")
+    
+    # Compute teacher targets
+    teacher_class_means, teacher_gram = compute_teacher_targets(args, distiller, dataset, device)
+    
+    # Broadcast to all ranks if using distributed training
+    if dist.get_world_size() > 1:
+        # Broadcast from rank 0 to all other ranks
+        if dist.get_rank() == 0:
+            # Send tensors to all ranks
+            objects = [teacher_class_means, teacher_gram]
+        else:
+            objects = [None, None]
+        
+        dist.broadcast_object_list(objects, src=0)
+        teacher_class_means, teacher_gram = objects
+        
+        # Move to correct device
+        if teacher_class_means is not None:
+            teacher_class_means = teacher_class_means.to(device)
+            teacher_gram = teacher_gram.to(device)
+    
+    return teacher_class_means, teacher_gram
+
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device):
     log_rank("Start Fine-tuning")
     start_time = time.time()
@@ -79,6 +312,27 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         dp_rank = dist.get_rank()
         dp_group = None
         criterion = build_criterion(args)
+        
+        # NEW CODE: Ensure NC2 criterion has teacher targets set
+        if isinstance(criterion, NC2):
+            # Check if teacher targets are already set in the model's criterion
+            model_criterion = None
+            if hasattr(model.module, 'criterion'):
+                model_criterion = model.module.criterion
+            elif hasattr(model.module, 'loss_function'):
+                model_criterion = model.module.loss_function
+            
+            # If model has NC2 criterion and our criterion has targets, copy them
+            if (isinstance(model_criterion, NC2) and 
+                hasattr(criterion, 'teacher_class_means') and 
+                hasattr(criterion, 'teacher_gram')):
+                model_criterion.set_teacher_targets(
+                    criterion.teacher_class_means, 
+                    criterion.teacher_gram
+                )
+                log_rank("Teacher targets copied to model's NC2 criterion")
+        
+    # Rest of the finetune function remains the same...
     sampler = DistributedSampler(
         dataset["train"], 
         shuffle=True, 
@@ -620,6 +874,9 @@ def evaluate(args, tokenizer, student_model, dataset, split, device):
             overall.get('precision', 0.0), 
             overall.get('recall', 0.0))
 
+
+# Replace the relevant parts in main() function:
+
 def main():
     torch.backends.cudnn.enabled = False
     args = get_args()
@@ -647,6 +904,23 @@ def main():
     log_rank("Initializing a distiller for knowledge distillation...")
     distiller = Distiller(args, device)
     dataset = prepare_dataset(args, distiller)
+    
+    # Pre-compute teacher targets if using NC2 criterion - DO THIS BEFORE DEEPSPEED INITIALIZATION
+    teacher_class_means = None
+    teacher_gram = None
+    criterion = build_criterion(args)
+    if isinstance(criterion, NC2) and args.do_train:
+        log_rank("NC2 criterion detected. Pre-computing teacher targets...")
+        
+        # Load or compute teacher targets over the full dataset
+        teacher_class_means, teacher_gram = load_or_compute_teacher_targets(
+            args, distiller, dataset, device
+        )
+        
+        if teacher_class_means is None or teacher_gram is None:
+            raise RuntimeError("Failed to compute or load teacher targets for NC2")
+        
+        log_rank("Teacher targets successfully computed")
     
     if args.do_train:
         args.train_iters_per_epoch = int(len(dataset["train"]) / (args.batch_size * dp_world_size))
@@ -677,12 +951,44 @@ def main():
         config_params=ds_config
     )
     
+    # IMPORTANT: Set teacher targets AFTER deepspeed initialization
+    if isinstance(criterion, NC2) and args.do_train and teacher_class_means is not None:
+        log_rank("Setting teacher targets in model engine...")
+        
+        # The distiller inside the model_engine will have the actual criterion used during training
+        # We need to find and set the teacher targets in that criterion
+        if hasattr(model_engine.module, 'forward'):
+            # Try to access the criterion that will actually be used
+            # This is a bit hacky but necessary due to deepspeed wrapping
+            
+            # Method 1: Set in any NC2 criterion we can find in the distiller
+            def set_teacher_targets_recursive(obj, class_means, gram):
+                if isinstance(obj, NC2):
+                    obj.set_teacher_targets(class_means, gram)
+                    log_rank("Set teacher targets in NC2 criterion")
+                    return True
+                elif hasattr(obj, '__dict__'):
+                    for attr_name, attr_value in obj.__dict__.items():
+                        if set_teacher_targets_recursive(attr_value, class_means, gram):
+                            return True
+                return False
+            
+            success = set_teacher_targets_recursive(model_engine.module, teacher_class_means, teacher_gram)
+            
+            if not success:
+                log_rank("Warning: Could not find NC2 criterion in model engine to set teacher targets")
+        
+        # Method 2: Also try to pass the teacher targets through the args for the criterion to access
+        if not hasattr(args, '_teacher_class_means'):
+            args._teacher_class_means = teacher_class_means
+            args._teacher_gram = teacher_gram
+            log_rank("Stored teacher targets in args as fallback")
+    
     if args.do_train:
         finetune(args, distiller.student_tokenizer, model_engine, optimizer, lr_scheduler, dataset, device)
        
     if args.do_eval:
         evaluate_mrl_with_nc(args, distiller.student_tokenizer, model_engine.module.student_model, dataset["test"], "test", device)
         
-    
 if __name__ == "__main__":
     main()
