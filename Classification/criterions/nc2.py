@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from typing import List, Dict, Optional, Tuple
 from .matry_CE import Matry_CrossEntropyLoss
-from .accumulate import MeanAccumulator
+from neural_collapse.accumulate import MeanAccumulator
 import torch.nn.functional as F
 
 class OrthogonalProjection(nn.Module):
@@ -16,10 +16,13 @@ class OrthogonalProjection(nn.Module):
             nn.init.orthogonal_(self.projector.weight)
 
     def forward(self, x):
-        # Handle dtype conversion - ensure projector weights match input dtype
-        if x.dtype != self.projector.weight.dtype:
-            # Convert projector weights to match input dtype
-            self.projector.weight.data = self.projector.weight.data.to(x.dtype)
+        # Handle both device and dtype mismatches
+        if (x.device != self.projector.weight.device or 
+            x.dtype != self.projector.weight.dtype):
+            # Move and convert projector weights to match input
+            self.projector.weight.data = self.projector.weight.data.to(
+                device=x.device, dtype=x.dtype
+            )
         
         return self.projector(x)
         
@@ -55,10 +58,11 @@ class NC2(Matry_CrossEntropyLoss):
         self.ema_momentum = getattr(args, 'ema_momentum', 0.95)  # EMA momentum (beta in paper)
         self.nc2_alpha = getattr(args, 'nc2_alpha', 0.5)  # Interpolation between batch and EMA
         self.epsilon = 1e-8  # Small constant for numerical stability
+        self.num_labels = args.num_labels  # Number of classes for classification
         
         # Initialize projection matrices for each nesting dimension
-        # Assuming teacher has hidden size 1024
-        self.teacher_hidden_size = 1024
+        # Assuming teacher has hidden size 2048
+        self.teacher_hidden_size = 2048
         self.projectors = nn.ModuleDict()
         
         for dim in self.nesting_list:
@@ -67,62 +71,63 @@ class NC2(Matry_CrossEntropyLoss):
                 out_dim=self.teacher_hidden_size
             )
         
-        # Initialize EMA class means for each dimension
-        self.register_buffer('teacher_class_means', None)
-        self.register_buffer('teacher_gram', None)
-        self.ema_class_means = {}
-        for dim in self.nesting_list:
-            self.register_buffer(f'ema_means_{dim}', None)
+        # Teacher targets will be set via set_teacher_targets() method
+        self.teacher_targets_set = False
         
-        # Initialize accumulators for computing class means
+        # Initialize accumulators for computing class means (not used in current implementation)
         self.accumulators = {}
         for dim in self.nesting_list:
             self.accumulators[dim] = None
     
+    def check_and_load_teacher_targets_from_args(self, args):
+        """
+        Fallback method to load teacher targets from args if they haven't been set directly
+        """
+        if not self.teacher_targets_set and hasattr(args, '_teacher_class_means') and hasattr(args, '_teacher_gram'):
+            self.set_teacher_targets(args._teacher_class_means, args._teacher_gram)
+            return True
+        return False
+    
     def to(self, device, dtype=None):
         """Override to method to ensure projectors are moved to the correct device and dtype"""
-        super().to(device, dtype=dtype)
-        self.projectors.to(device, dtype=dtype)
-        return self
+        result = super().to(device, dtype=dtype)
+        # Ensure projectors are also moved
+        for proj in self.projectors.values():
+            proj.to(device, dtype=dtype)
+        return result
     
     def cuda(self, device=None):
         """Override cuda method to ensure projectors are moved to CUDA"""
-        super().cuda(device)
-        self.projectors.cuda(device)
-        return self
+        result = super().cuda(device)
+        # Ensure projectors are also moved
+        for proj in self.projectors.values():
+            proj.cuda(device)
+        return result
     
-    def compute_teacher_targets(self, teacher_outputs, labels, device):
+    def set_teacher_targets(self, teacher_class_means, teacher_gram):
         """
-        Pre-compute teacher class means and Gram matrix (done once after teacher training)
-        This should ideally be called during initialization with the full training set
+        Set pre-computed teacher targets from offline computation.
+        This should be called after teacher pre-training is complete and 
+        teacher targets have been computed over the full dataset.
+        
+        Args:
+            teacher_class_means (torch.Tensor): Pre-computed teacher class means [num_classes, hidden_size]
+            teacher_gram (torch.Tensor): Pre-computed normalized teacher Gram matrix [num_classes, num_classes]
         """
-        if self.teacher_class_means is None:
-            # This is a simplified version - in practice, you'd compute this over the full dataset
-            # For now, we'll compute batch statistics as a proxy
-            with torch.no_grad():
-                # Get teacher embeddings ([CLS] token from last hidden state)
-                if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states is not None:
-                    teacher_embeddings = teacher_outputs.hidden_states[-1][:, 0]  # [batch_size, teacher_hidden_size]
-                else:
-                    # Fallback: use pooler output if available
-                    teacher_embeddings = teacher_outputs.pooler_output
-                
-                # Initialize teacher class means (simplified - using batch stats)
-                num_classes = self.num_labels
-                self.teacher_class_means = torch.zeros(num_classes, self.teacher_hidden_size, 
-                                                       device=device, dtype=teacher_embeddings.dtype)
-                class_counts = torch.zeros(num_classes, device=device)
-                
-                # Accumulate class means
-                for i in range(num_classes):
-                    mask = (labels == i)
-                    if mask.sum() > 0:
-                        self.teacher_class_means[i] = teacher_embeddings[mask].mean(dim=0)
-                        class_counts[i] = mask.sum()
-                
-                # Compute teacher Gram matrix and normalize
-                self.teacher_gram = torch.mm(self.teacher_class_means, self.teacher_class_means.t())
-                self.teacher_gram = self.teacher_gram / (torch.norm(self.teacher_gram, p='fro') + self.epsilon)
+        # Remove any existing buffers with these names
+        if hasattr(self, 'teacher_class_means'):
+            delattr(self, 'teacher_class_means')
+        if hasattr(self, 'teacher_gram'):
+            delattr(self, 'teacher_gram')
+        
+        # Register as non-persistent buffers (no gradients, not saved with model)
+        self.register_buffer('teacher_class_means', teacher_class_means.detach().clone(), persistent=False)
+        self.register_buffer('teacher_gram', teacher_gram.detach().clone(), persistent=False)
+        
+        self.teacher_targets_set = True
+        
+        print(f"Set teacher targets: class_means shape {teacher_class_means.shape}, "
+              f"gram shape {teacher_gram.shape}")
     
     def compute_student_class_means(self, embeddings, labels, dim, batch_size):
         """
@@ -150,18 +155,28 @@ class NC2(Matry_CrossEntropyLoss):
         Update EMA class means for a specific dimension
         """
         ema_buffer_name = f'ema_means_{dim}'
-        ema_means = getattr(self, ema_buffer_name)
         
-        if ema_means is None:
-            # Initialize EMA means
-            setattr(self, ema_buffer_name, batch_means.clone())
+        # Check if EMA means buffer exists and is a tensor
+        if (hasattr(self, ema_buffer_name) and 
+            getattr(self, ema_buffer_name) is not None and
+            isinstance(getattr(self, ema_buffer_name), torch.Tensor)):
+            ema_means = getattr(self, ema_buffer_name)
         else:
-            # Update EMA for classes present in batch
-            mask = (class_counts > 0)
-            ema_means[mask] = self.ema_momentum * ema_means[mask] + (1 - self.ema_momentum) * batch_means[mask]
-            setattr(self, ema_buffer_name, ema_means)
+            # Delete existing attribute if it exists as None (from __init__)
+            if hasattr(self, ema_buffer_name):
+                delattr(self, ema_buffer_name)
+            
+            # Initialize EMA means as buffer (no gradients)
+            self.register_buffer(ema_buffer_name, batch_means.detach().clone(), persistent=False)
+            ema_means = getattr(self, ema_buffer_name)
+            return ema_means
         
-        return getattr(self, ema_buffer_name)
+        # Update EMA for classes present in batch
+        mask = (class_counts > 0)
+        with torch.no_grad():  # Ensure no gradients for EMA updates
+            ema_means[mask] = self.ema_momentum * ema_means[mask] + (1 - self.ema_momentum) * batch_means[mask].detach()
+        
+        return ema_means
     
     def compute_gram_matrix(self, class_means, normalize=True):
         """
@@ -201,8 +216,9 @@ class NC2(Matry_CrossEntropyLoss):
             # Compute NC2 loss (Frobenius norm of difference)
             nc2_loss = torch.norm(student_gram - teacher_gram_subset, p='fro') ** 2
         else:
-            nc2_loss = torch.tensor(0.0, device=device)
-        
+            nc2_loss = torch.tensor(0.0, device=device, dtype=student_embeddings.dtype)
+        print(f"nc2_batch_loss: {nc2_loss}")
+
         return nc2_loss, batch_means, class_counts, projected_embeddings
     
     def compute_nc2_ema_loss(self, student_embeddings, labels, dim):
@@ -223,15 +239,16 @@ class NC2(Matry_CrossEntropyLoss):
         # Update EMA means
         ema_means = self.update_ema_means(batch_means, class_counts, dim)
         
-        # Project EMA means (they're already in teacher space)
-        ema_means_proj = ema_means
-        
         # Compute EMA-based student Gram
-        student_gram_ema = self.compute_gram_matrix(ema_means_proj, normalize=True)
+        student_gram_ema = self.compute_gram_matrix(ema_means, normalize=True)
         
-        # Compute NC2 loss against full teacher Gram
-        nc2_loss = torch.norm(student_gram_ema - self.teacher_gram, p='fro') ** 2
-        
+        # Compute NC2 loss against full teacher Gram (ensure teacher gram is detached)
+        if self.teacher_gram is not None:
+            teacher_gram_detached = self.teacher_gram.detach()
+            nc2_loss = torch.norm(student_gram_ema - teacher_gram_detached, p='fro') ** 2
+        else:
+            nc2_loss = torch.tensor(0.0, device=device, dtype=student_embeddings.dtype)
+        print("ema_nc2_loss:", nc2_loss)
         return nc2_loss
     
     def compute_nc2_loss(
@@ -244,14 +261,25 @@ class NC2(Matry_CrossEntropyLoss):
         labels = output_data["labels"]
         batch_size = labels.shape[0]
         
-        # Ensure teacher targets are computed
-        self.compute_teacher_targets(teacher_outputs, labels, device)
-        
+        # Check if teacher targets have been set, if not try fallback
+        if not self.teacher_targets_set:
+            # Try to get from distiller's args
+            if hasattr(distiller, 'args'):
+                self.check_and_load_teacher_targets_from_args(distiller.args)
+            
+            # If still not set, raise error
+            if not self.teacher_targets_set:
+                raise RuntimeError(
+                    "Teacher targets have not been set. Call set_teacher_targets() with "
+                    "pre-computed teacher class means and Gram matrix before training."
+                )
         # Get student embeddings for different dimensions
         student_embeddings_dict = self.get_student_embeddings_by_dimension(model_outputs, distiller)
+
         
-        total_nc2_loss = 0.0
-        total_ortho_loss = 0.0
+        # Initialize loss tensors on the correct device
+        total_nc2_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        total_ortho_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         
         # Compute losses for each nesting dimension
         for dim in self.nesting_list:
@@ -263,8 +291,10 @@ class NC2(Matry_CrossEntropyLoss):
             # Get classes present in batch for teacher Gram subset
             unique_classes = labels.unique()
             if self.teacher_gram is not None and len(unique_classes) > 1:
-                teacher_gram_subset = self.teacher_gram[unique_classes][:, unique_classes]
-                teacher_gram_subset = teacher_gram_subset / (torch.norm(teacher_gram_subset, p='fro') + self.epsilon)
+                # Detach teacher gram to prevent gradient flow
+                teacher_gram_subset = self.teacher_gram.detach()[unique_classes][:, unique_classes]
+                gram_norm = torch.norm(teacher_gram_subset, p='fro') + self.epsilon
+                teacher_gram_subset = teacher_gram_subset / gram_norm
             else:
                 teacher_gram_subset = None
             
@@ -274,11 +304,11 @@ class NC2(Matry_CrossEntropyLoss):
                     student_embeddings, labels, dim, teacher_gram_subset
                 )
             else:
-                batch_nc2_loss = torch.tensor(0.0, device=device)
+                batch_nc2_loss = torch.tensor(0.0, device=device, dtype=student_embeddings.dtype)
             
             # Compute EMA NC2 loss
             ema_nc2_loss = self.compute_nc2_ema_loss(student_embeddings, labels, dim)
-            
+                
             # Combine batch and EMA losses
             nc2_loss_dim = self.nc2_alpha * batch_nc2_loss + (1 - self.nc2_alpha) * ema_nc2_loss
             
@@ -287,20 +317,20 @@ class NC2(Matry_CrossEntropyLoss):
             ortho_loss_dim = projector.orthogonal_regularization_loss()
             
             # Accumulate losses
-            total_nc2_loss += nc2_loss_dim
-            total_ortho_loss += ortho_loss_dim
+            total_nc2_loss = total_nc2_loss + nc2_loss_dim
+            total_ortho_loss = total_ortho_loss + ortho_loss_dim
             
-            # Log per-dimension losses
-            log[f'nc2_loss_{dim}'] = nc2_loss_dim.item()
-            log[f'ortho_loss_{dim}'] = ortho_loss_dim.item()
+            # Log per-dimension losses (ensure they are detached)
+            log[f'nc2_loss_{dim}'] = nc2_loss_dim.detach()
+            log[f'ortho_loss_{dim}'] = ortho_loss_dim.detach()
         
         # Combine all losses
         total_loss = self.nc2_lambda * total_nc2_loss + self.ortho_lambda * total_ortho_loss
         
-        # Log total losses
-        log['nc2_loss_total'] = total_nc2_loss.item()
-        log['ortho_loss_total'] = total_ortho_loss.item()
-        log['nc2_combined_loss'] = total_loss.item()
+        # Log total losses (ensure they are detached)
+        log['nc2_loss_total'] = total_nc2_loss.detach()
+        log['ortho_loss_total'] = total_ortho_loss.detach()
+        log['nc2_combined_loss'] = total_loss.detach()
         
         return total_loss, log
     
@@ -377,7 +407,7 @@ class NC2(Matry_CrossEntropyLoss):
             loss, nll_loss = self.compute_cross_entropy_loss(logits, target)
             correct = self.compute_accuracy(logits, target)
 
-        # Teacher forward pass (no gradient)
+        # Teacher forward pass (no gradient) - CRITICAL: detach outputs properly
         with torch.no_grad():
             teacher_model.eval()
             teacher_outputs = teacher_model(
@@ -385,25 +415,41 @@ class NC2(Matry_CrossEntropyLoss):
                 attention_mask=input_data["teacher_attention_mask"],
                 output_hidden_states=True
             )
+            
+            # Detach all teacher outputs to prevent gradient flow
+            if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states is not None:
+                # Detach each hidden state
+                detached_hidden_states = [hs.detach() for hs in teacher_outputs.hidden_states]
+                # Create a new object with detached hidden states
+                class DetachedOutputs:
+                    def __init__(self, hidden_states):
+                        self.hidden_states = hidden_states
+                teacher_outputs_detached = DetachedOutputs(detached_hidden_states)
+            elif isinstance(teacher_outputs, dict) and 'hidden_states' in teacher_outputs:
+                teacher_outputs_detached = {
+                    'hidden_states': [hs.detach() for hs in teacher_outputs['hidden_states']]
+                }
+            else:
+                teacher_outputs_detached = teacher_outputs
         
         # Initialize log dictionary
         log = {}
         
-        # Compute NC2 distillation loss
+        # Compute NC2 distillation loss using detached teacher outputs
         kd_loss, log = self.compute_nc2_loss(
-            model_outputs, teacher_outputs, output_data, input_data, distiller, log
+            model_outputs, teacher_outputs_detached, output_data, input_data, distiller, log
         )
-        
+        print("full_nc2_loss:", kd_loss)
         # Combine losses
         loss = (1.0 - self.kd_rate) * loss + self.kd_rate * kd_loss
-        log["loss"] = loss
+        
+        # Ensure loss is a tensor
+        log["loss"] = loss.detach() if isinstance(loss, torch.Tensor) else torch.tensor(loss, device=target.device)
 
-        # Compute accuracy from the first/main logits
+        # Compute accuracy from the first/main logits (ensure it's a tensor)
         main_logits = list(logits_dict.values())[0]
-        accuracy = self.compute_accuracy(
-            main_logits, output_data["labels"]
-        )
-        log["accuracy"] = accuracy
+        accuracy = self.compute_accuracy(main_logits, target)
+        log["accuracy"] = accuracy.detach() if isinstance(accuracy, torch.Tensor) else torch.tensor(accuracy, device=target.device)
 
         # Update logging output
         logging_output = self.record_logging_output(
