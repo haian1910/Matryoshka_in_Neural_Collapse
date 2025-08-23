@@ -2,7 +2,7 @@ import time
 import os
 
 from sklearn.metrics import precision_score, recall_score, precision_recall_fscore_support
-from Classification.criterions.nc2 import NC2
+from Classification.criterions.full_nc import FULL_NC
 
 import torch
 import torch.nn as nn
@@ -313,8 +313,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         dp_group = None
         criterion = build_criterion(args)
         
-        # NEW CODE: Ensure NC2 criterion has teacher targets set
-        if isinstance(criterion, NC2):
+        # NEW CODE: Ensure FULL_NC criterion has teacher targets set
+        if isinstance(criterion, FULL_NC):
             # Check if teacher targets are already set in the model's criterion
             model_criterion = None
             if hasattr(model.module, 'criterion'):
@@ -322,15 +322,15 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             elif hasattr(model.module, 'loss_function'):
                 model_criterion = model.module.loss_function
             
-            # If model has NC2 criterion and our criterion has targets, copy them
-            if (isinstance(model_criterion, NC2) and 
+            # If model has FULL_NC criterion and our criterion has targets, copy them
+            if (isinstance(model_criterion, FULL_NC) and 
                 hasattr(criterion, 'teacher_class_means') and 
                 hasattr(criterion, 'teacher_gram')):
                 model_criterion.set_teacher_targets(
                     criterion.teacher_class_means, 
                     criterion.teacher_gram
                 )
-                log_rank("Teacher targets copied to model's NC2 criterion")
+                log_rank("Teacher targets copied to model's FULL_NC criterion")
         
     # Rest of the finetune function remains the same...
     sampler = DistributedSampler(
@@ -905,12 +905,12 @@ def main():
     distiller = Distiller(args, device)
     dataset = prepare_dataset(args, distiller)
     
-    # Pre-compute teacher targets if using NC2 criterion - DO THIS BEFORE DEEPSPEED INITIALIZATION
+    # Pre-compute teacher targets if using FULL_NC criterion - DO THIS BEFORE DEEPSPEED INITIALIZATION
     teacher_class_means = None
     teacher_gram = None
     criterion = build_criterion(args)
-    if isinstance(criterion, NC2) and args.do_train:
-        log_rank("NC2 criterion detected. Pre-computing teacher targets...")
+    if isinstance(criterion, FULL_NC) and args.do_train:
+        log_rank("FULL_NC criterion detected. Pre-computing teacher targets...")
         
         # Load or compute teacher targets over the full dataset
         teacher_class_means, teacher_gram = load_or_compute_teacher_targets(
@@ -918,7 +918,7 @@ def main():
         )
         
         if teacher_class_means is None or teacher_gram is None:
-            raise RuntimeError("Failed to compute or load teacher targets for NC2")
+            raise RuntimeError("Failed to compute or load teacher targets for FULL_NC")
         
         log_rank("Teacher targets successfully computed")
     
@@ -952,7 +952,7 @@ def main():
     )
     
     # IMPORTANT: Set teacher targets AFTER deepspeed initialization
-    if isinstance(criterion, NC2) and args.do_train and teacher_class_means is not None:
+    if isinstance(criterion, FULL_NC) and args.do_train and teacher_class_means is not None:
         log_rank("Setting teacher targets in model engine...")
         
         # The distiller inside the model_engine will have the actual criterion used during training
@@ -961,11 +961,11 @@ def main():
             # Try to access the criterion that will actually be used
             # This is a bit hacky but necessary due to deepspeed wrapping
             
-            # Method 1: Set in any NC2 criterion we can find in the distiller
+            # Method 1: Set in any FULL_NC criterion we can find in the distiller
             def set_teacher_targets_recursive(obj, class_means, gram):
-                if isinstance(obj, NC2):
+                if isinstance(obj, FULL_NC):
                     obj.set_teacher_targets(class_means, gram)
-                    log_rank("Set teacher targets in NC2 criterion")
+                    log_rank("Set teacher targets in FULL_NC criterion")
                     return True
                 elif hasattr(obj, '__dict__'):
                     for attr_name, attr_value in obj.__dict__.items():
@@ -976,7 +976,7 @@ def main():
             success = set_teacher_targets_recursive(model_engine.module, teacher_class_means, teacher_gram)
             
             if not success:
-                log_rank("Warning: Could not find NC2 criterion in model engine to set teacher targets")
+                log_rank("Warning: Could not find FULL_NC criterion in model engine to set teacher targets")
         
         # Method 2: Also try to pass the teacher targets through the args for the criterion to access
         if not hasattr(args, '_teacher_class_means'):
