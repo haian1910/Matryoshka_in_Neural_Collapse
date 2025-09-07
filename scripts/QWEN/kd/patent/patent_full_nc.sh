@@ -15,31 +15,31 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=/Matryoshka_in_Neural_Collapse
+BASE_PATH=/content/Matryoshka_in_Neural_Collapse
 CKPT_NAME="bert"
 CKPT_PATH="${BASE_PATH}/model_hub/${CKPT_NAME}"
 TEACHER_MODEL_NAME="QWEN"
-TEACHER_MODEL_PATH="${BASE_PATH}/model_hub/${TEACHER_MODEL_NAME}" # GẮN LINK MODEL CHECKPOINT VÀO ĐÂY
+TEACHER_MODEL_PATH="/content/drive/MyDrive/2MMath/data_distillation/checkpoint_for_test/Llama_agnews_4_class" # GẮN LINK MODEL CHECKPOINT VÀO ĐÂY
 # data
-DATA_DIR="${BASE_PATH}/data/patent/" # gắn link data vào đây
+DATA_DIR="/content/drive/MyDrive/2MMath/data_distillation/data_test/ag_news_30"
 NUM_LABELS=9
 # task
-TASK="full_nc"
+TASK="full"
 # hp
-BATCH_SIZE=8
+BATCH_SIZE=4
 LR=0.00001
 GRAD_ACC=1
-EVAL_BATCH_SIZE=8
-EPOCH=5
+EVAL_BATCH_SIZE=4
+EPOCH=1
 KD_RATE=0.5
 KD_TEMP=2.0
 # length
-MAX_LENGTH=512
+MAX_LENGTH=64
 # distiller
 PROJECTOR_CONFIG_PATH="${BASE_PATH}/configs/projector_config.json"
 PROJECTOR_LR=0.001
 # runtime
-PRECISION="bf16"
+PRECISION="fp32"
 CRITERION="full_nc"
 KD_OBJ="forward_kl"  # [forward_kl, reverse_kl, js_divergence, skewed_forward_kl, skewed_reverse_kl, adaptive_kl]
 CONFIG="${KD_OBJ}"
@@ -100,7 +100,7 @@ OPTS+=" --criterion ${CRITERION}"
 OPTS+=" --seed ${SEED}"
 # deepspeed
 OPTS+=" --deepspeed"
-OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_test.json"
+OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_fp32.json"
 
 
 
@@ -108,7 +108,7 @@ export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3
 export PYTHONPATH=${BASE_PATH}
-CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/QWEN_Matry_distillation.py ${OPTS}"
+CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/Classification/matry_distillation.py ${OPTS}"
 
 ${CMD} \
 >> ${SAVE_PATH}/train.log 2>&1 &
