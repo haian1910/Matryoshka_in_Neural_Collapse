@@ -5,56 +5,46 @@ from typing import List, Dict, Optional, Tuple
 from .matry_CE import Matry_CrossEntropyLoss
 from neural_collapse.accumulate import MeanAccumulator
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import orthogonal
+
 
 class OrthogonalProjection(nn.Module):
-    def __init__(self, in_dim=768, out_dim=2048):
-        super(OrthogonalProjection, self).__init__()
-        # Create a regular linear layer first
-        self.projector = nn.Linear(in_dim, out_dim, bias=False)
-        # Initialize with orthogonal weights (in float32)
-        with torch.no_grad():
-            nn.init.orthogonal_(self.projector.weight)
-
+    """Orthogonal projection layer using PyTorch's built-in orthogonal parameterization.
+    
+    Maps student features to teacher dimension using guaranteed orthogonal matrices.
+    Uses torch.nn.utils.parametrizations.orthogonal for true orthogonality.
+    """
+    
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        
+        # Create linear layer
+        self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        
+        # Apply orthogonal parameterization to ensure the weight matrix is always orthogonal
+        # This automatically maintains orthogonality during training
+        orthogonal(self.linear, 'weight')
+        
     def forward(self, x):
-        # Handle both device and dtype mismatches
-        if (x.device != self.projector.weight.device or 
-            x.dtype != self.projector.weight.dtype):
-            # Move and convert projector weights to match input
-            self.projector.weight.data = self.projector.weight.data.to(
-                device=x.device, dtype=x.dtype
-            )
+        """Apply orthogonal projection."""
+        # Ensure the linear layer is on the same device and dtype as input
+        if (x.device != self.linear.weight.device or 
+            x.dtype != self.linear.weight.dtype):
+            self.linear = self.linear.to(device=x.device, dtype=x.dtype)
         
-        return self.projector(x)
-        
-    def orthogonal_regularization_loss(self):
-        """
-        Optional: Add this to your total loss to maintain orthogonality during training
-        L_ortho = ||W^T W - I||_F^2
-        """
-        W = self.projector.weight  # [out_dim, in_dim]
-        if W.shape[0] >= W.shape[1]:  # out_dim >= in_dim
-            # W^T W should be identity
-            WtW = torch.mm(W.t(), W)  # [in_dim, in_dim]
-            I = torch.eye(W.shape[1], device=W.device, dtype=W.dtype)
-        else:  # out_dim < in_dim  
-            # W W^T should be identity
-            WWt = torch.mm(W, W.t())  # [out_dim, out_dim]
-            I = torch.eye(W.shape[0], device=W.device, dtype=W.dtype)
-            WtW = WWt
-        
-        ortho_loss = torch.norm(WtW - I, p='fro') ** 2
-        return ortho_loss
+        return self.linear(x)
 
 class FULL_NC(Matry_CrossEntropyLoss):
     def __init__(self, args) -> None:
         super().__init__(args)
         self.kd_rate = args.kd_rate
-        self.nesting_list = getattr(args, 'mrl_nesting_list', [128, 256, 512, 768])
+        self.nesting_list = getattr(args, 'mrl_nesting_list', [8, 16, 32, 64, 128, 256, 512, 768])
         self.mrl_efficient = getattr(args, 'mrl_efficient', False)
         
         # NC2 specific hyperparameters
         self.nc2_lambda = getattr(args, 'nc2_lambda', 1.0)  # Weight for NC2 loss
-        self.ortho_lambda = getattr(args, 'ortho_lambda', 1)  # Weight for orthogonality loss
         self.ema_momentum = getattr(args, 'ema_momentum', 0.95)  # EMA momentum (beta in paper)
         self.nc2_alpha = getattr(args, 'nc2_alpha', 0.5)  # Interpolation between batch and EMA
         self.epsilon = 1e-8  # Small constant for numerical stability
@@ -62,7 +52,7 @@ class FULL_NC(Matry_CrossEntropyLoss):
         
         # Initialize projection matrices for each nesting dimension
         # Assuming teacher has hidden size 2048
-        self.teacher_hidden_size = 2048
+        self.teacher_hidden_size = 1024
         self.projectors = nn.ModuleDict()
         
         for dim in self.nesting_list:
@@ -161,6 +151,15 @@ class FULL_NC(Matry_CrossEntropyLoss):
             getattr(self, ema_buffer_name) is not None and
             isinstance(getattr(self, ema_buffer_name), torch.Tensor)):
             ema_means = getattr(self, ema_buffer_name)
+            
+            # Ensure EMA means are on the same device as batch_means
+            if ema_means.device != batch_means.device:
+                # Move EMA means to the correct device
+                ema_means = ema_means.to(device=batch_means.device, dtype=batch_means.dtype)
+                # Re-register the buffer on the correct device
+                delattr(self, ema_buffer_name)
+                self.register_buffer(ema_buffer_name, ema_means, persistent=False)
+                ema_means = getattr(self, ema_buffer_name)
         else:
             # Delete existing attribute if it exists as None (from __init__)
             if hasattr(self, ema_buffer_name):
@@ -196,6 +195,10 @@ class FULL_NC(Matry_CrossEntropyLoss):
         
         # Project student embeddings
         projector = self.projectors[f'proj_{dim}']
+        # Ensure projector is on the same device as student embeddings
+        if next(projector.parameters()).device != device:
+            projector = projector.to(device)
+        
         projected_embeddings = projector(student_embeddings)
         
         # Compute batch class means
@@ -213,6 +216,10 @@ class FULL_NC(Matry_CrossEntropyLoss):
             # Compute student Gram matrix for batch
             student_gram = self.compute_gram_matrix(batch_means_subset, normalize=True)
             
+            # Ensure teacher_gram_subset is on the same device
+            if teacher_gram_subset.device != device:
+                teacher_gram_subset = teacher_gram_subset.to(device)
+            
             # Compute NC2 loss (Frobenius norm of difference)
             nc2_loss = torch.norm(student_gram - teacher_gram_subset, p='fro') ** 2
         else:
@@ -229,6 +236,10 @@ class FULL_NC(Matry_CrossEntropyLoss):
         
         # Project student embeddings
         projector = self.projectors[f'proj_{dim}']
+        # Ensure projector is on the same device as student embeddings
+        if next(projector.parameters()).device != device:
+            projector = projector.to(device)
+        
         projected_embeddings = projector(student_embeddings)
         
         # Compute batch class means
@@ -245,6 +256,9 @@ class FULL_NC(Matry_CrossEntropyLoss):
         # Compute NC2 loss against full teacher Gram (ensure teacher gram is detached)
         if self.teacher_gram is not None:
             teacher_gram_detached = self.teacher_gram.detach()
+            # Ensure teacher gram is on the same device
+            if teacher_gram_detached.device != device:
+                teacher_gram_detached = teacher_gram_detached.to(device)
             nc2_loss = torch.norm(student_gram_ema - teacher_gram_detached, p='fro') ** 2
         else:
             nc2_loss = torch.tensor(0.0, device=device, dtype=student_embeddings.dtype)
@@ -273,13 +287,21 @@ class FULL_NC(Matry_CrossEntropyLoss):
                     "Teacher targets have not been set. Call set_teacher_targets() with "
                     "pre-computed teacher class means and Gram matrix before training."
                 )
+        
+        # Ensure teacher targets are on the correct device
+        if hasattr(self, 'teacher_gram') and self.teacher_gram is not None:
+            if self.teacher_gram.device != device:
+                self.teacher_gram = self.teacher_gram.to(device)
+        if hasattr(self, 'teacher_class_means') and self.teacher_class_means is not None:
+            if self.teacher_class_means.device != device:
+                self.teacher_class_means = self.teacher_class_means.to(device)
+        
         # Get student embeddings for different dimensions
         student_embeddings_dict = self.get_student_embeddings_by_dimension(model_outputs, distiller)
 
         
         # Initialize loss tensors on the correct device
         total_nc2_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        total_ortho_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         
         # Compute losses for each nesting dimension
         for dim in self.nesting_list:
@@ -287,6 +309,10 @@ class FULL_NC(Matry_CrossEntropyLoss):
                 continue
             
             student_embeddings = student_embeddings_dict[dim]
+            
+            # Ensure student embeddings are on the correct device
+            if student_embeddings.device != device:
+                student_embeddings = student_embeddings.to(device)
             
             # Get classes present in batch for teacher Gram subset
             unique_classes = labels.unique()
@@ -314,22 +340,18 @@ class FULL_NC(Matry_CrossEntropyLoss):
             
             # Add orthogonality regularization for this dimension's projector
             projector = self.projectors[f'proj_{dim}']
-            ortho_loss_dim = projector.orthogonal_regularization_loss()
             
             # Accumulate losses
             total_nc2_loss = total_nc2_loss + nc2_loss_dim
-            total_ortho_loss = total_ortho_loss + ortho_loss_dim
             
             # Log per-dimension losses (ensure they are detached)
             log[f'nc2_loss_{dim}'] = nc2_loss_dim.detach()
-            log[f'ortho_loss_{dim}'] = ortho_loss_dim.detach()
         
         # Combine all losses
-        total_loss = self.nc2_lambda * total_nc2_loss + self.ortho_lambda * total_ortho_loss
+        total_loss = self.nc2_lambda * total_nc2_loss 
         
         # Log total losses (ensure they are detached)
         log['nc2_loss_total'] = total_nc2_loss.detach()
-        log['ortho_loss_total'] = total_ortho_loss.detach()
         log['nc2_combined_loss'] = total_loss.detach()
         
         return total_loss, log
@@ -346,6 +368,8 @@ class FULL_NC(Matry_CrossEntropyLoss):
         3. Compute MSE loss
         4. Sum over all dimensions
         """
+        
+        device = output_data["labels"].device
         
         # Get teacher embeddings (Z_T)
         # Extract teacher hidden states - Handle different model architectures
@@ -366,7 +390,6 @@ class FULL_NC(Matry_CrossEntropyLoss):
         else:
             raise ValueError(f"Unexpected dimension for teacher_hidden: {teacher_hidden.shape}")
 
-        
         
         # Get student embeddings for different nesting dimensions
         student_embeddings_dict = {}
@@ -392,8 +415,7 @@ class FULL_NC(Matry_CrossEntropyLoss):
             else:
                 raise ValueError("Cannot extract student embeddings")
         
-        # Ensure full_student_embeddings is on the correct device and dtype
-        device = next(distiller.student_model.parameters()).device
+        # Ensure embeddings are on the correct device and dtype
         target_dtype = next(distiller.student_model.parameters()).dtype
         
         full_student_embeddings = full_student_embeddings.to(device=device, dtype=target_dtype)
@@ -404,8 +426,9 @@ class FULL_NC(Matry_CrossEntropyLoss):
             student_embeddings_dict[dim] = full_student_embeddings[:, :dim]  # [batch_size, dim]
         
         # Ensure projectors are on the correct device and dtype
-        if not next(self.projectors.parameters()).device == device:
-            self.projectors.to(device=device, dtype=target_dtype)
+        for proj_name, projector in self.projectors.items():
+            if next(projector.parameters()).device != device:
+                projector.to(device=device, dtype=target_dtype)
         
         # Compute NC1 distillation loss
         total_nc1_loss = 0.0
@@ -431,10 +454,7 @@ class FULL_NC(Matry_CrossEntropyLoss):
             total_nc1_loss += mse_loss
             nc1_losses_per_dim[f'nc1_loss_dim_{dim}'] = mse_loss.detach()  # Keep as tensor
             
-            # Optional: Add orthogonal regularization
-            if hasattr(self, 'use_ortho_reg') and self.use_ortho_reg:
-                ortho_loss = projector.orthogonal_regularization_loss()
-                total_nc1_loss += 1 * ortho_loss  # Small weight for regularization
+           
         
         # Update log with individual dimension losses (keep as tensors)
         log.update(nc1_losses_per_dim)
@@ -489,6 +509,11 @@ class FULL_NC(Matry_CrossEntropyLoss):
         teacher_model = distiller.teacher_model
         self.distiller = distiller
         target = output_data["labels"]
+        device = target.device
+        
+        # Ensure the loss module is on the correct device
+        if next(self.parameters()).device != device:
+            self.to(device)
         
         # Student forward pass with hidden states
         model_outputs = model(
