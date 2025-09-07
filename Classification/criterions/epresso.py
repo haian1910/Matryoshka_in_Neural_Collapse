@@ -174,11 +174,11 @@ class AdaptiveLayerClassificationLoss(nn.Module):
 
 class Epresso(CrossEntropyLoss):
     def __init__(self, args) -> None:
-        super(Epresso, self).__init__()
+        super(Epresso, self).__init__(args)
         self.label_smoothing = args.label_smoothing
         
         # Matryoshka configuration
-        self.matryoshka_dims = getattr(args, 'mrl_nesting_list', [768, 512, 256, 128, 64])
+        self.matryoshka_dims = getattr(args, 'mrl_nesting_list', [8, 16, 32, 64, 128, 256, 512, 768])
         self.matryoshka_weights = getattr(args, 'matryoshka_weights', None)
         self.n_dims_per_step = getattr(args, 'n_dims_per_step', -1)
         
