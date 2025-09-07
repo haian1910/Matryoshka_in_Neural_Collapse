@@ -38,8 +38,28 @@ def add_model_args(parser: argparse.ArgumentParser):
     group.add_argument("--dropout-path-rate", type=float, default=None)
     group.add_argument("--fp32", action="store_true")
     group.add_argument("--model-dtype", type=str, default="fp16")
-    # Add num_labels for classification tasks
     group.add_argument("--num-labels", type=int, default=2, help="Number of labels for classification tasks")
+
+    # Add Matryoshka-specific arguments
+    group.add_argument("--matryoshka_weights", type=float, nargs='+', default=None,
+                      help="Weights for different Matryoshka dimensions")
+    group.add_argument("--n_dims_per_step", type=int, default=-1,
+                      help="Number of dimensions to use per training step")
+    group.add_argument("--use_adaptive_layers", action='store_true',
+                      help="Whether to use adaptive layer training")
+    group.add_argument("--n_layers_per_step", type=int, default=1,
+                      help="Number of layers to train per step")
+    group.add_argument("--last_layer_weight", type=float, default=1.0,
+                      help="Weight for the last layer loss")
+    group.add_argument("--prior_layers_weight", type=float, default=1.0,
+                      help="Weight for the prior layers loss")
+    group.add_argument("--kl_div_weight", type=float, default=1.0,
+                      help="Weight for KL divergence loss")
+    group.add_argument("--kl_temperature", type=float, default=0.3,
+                      help="Temperature for KL divergence calculation")
+    group.add_argument("--log_dimension_losses", action='store_true',
+                      help="Whether to log losses for individual dimensions")
+
     return parser
 
 
