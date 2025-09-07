@@ -8,6 +8,7 @@ from .matry_CE import Matry_CrossEntropyLoss
 from .nc1 import NC1
 from .nc2 import NC2
 from .full_nc import FULL_NC
+from .epresso import Epresso
 criterion_list = {
     "cross_entropy": CrossEntropyLoss,
     "various_divergence": VariousDivergence,
@@ -19,7 +20,8 @@ criterion_list = {
     "matry_CE": Matry_CrossEntropyLoss,
     "nc1": NC1,
     "nc2": NC2,
-    "full_nc": FULL_NC
+    "full_nc": FULL_NC,
+    "epresso": Epresso
 }
 
 def build_criterion(args):
